@@ -64,7 +64,7 @@ export default function FollowerPanel() {
         <h2 className="font-semibold text-white">Follow a Trader</h2>
         <p className="text-xs text-gray-500">
           Enter a trader's address to follow their encrypted position.
-          You won't know their direction or size — only P&L is revealed at settlement.
+          You won't know their direction or size â€” only P&L is revealed at settlement.
         </p>
 
         <div>
@@ -83,9 +83,9 @@ export default function FollowerPanel() {
           <div className={`rounded-lg p-4 border ${isOpen ? "bg-green-950 border-green-800" : "bg-gray-800 border-gray-700"}`}>
             {isOpen ? (
               <div className="space-y-1">
-                <div className="text-green-400 font-medium text-sm">🔐 Active encrypted position</div>
+                <div className="text-green-400 font-medium text-sm">ðŸ” Active encrypted position</div>
                 <div className="text-xs text-gray-400">
-                  Entry price: ${positionData ? (Number(positionData[1]) / 1e6).toFixed(2) : "—"}
+                  Entry price: ${positionData ? (Number((positionData as [unknown, bigint, boolean, boolean])[1]) / 1e6).toFixed(2) : "â€”"}
                 </div>
                 <div className="text-xs text-gray-400">
                   Followers: {followerCount?.toString() ?? "0"} / 20
@@ -129,9 +129,9 @@ export default function FollowerPanel() {
         <h3 className="font-medium text-white mb-3">How it works</h3>
         <ol className="space-y-2 text-sm text-gray-400 list-decimal list-inside">
           <li>Find a trader address with an active encrypted position</li>
-          <li>Commit your allocation — it mirrors their trade proportionally</li>
+          <li>Commit your allocation â€” it mirrors their trade proportionally</li>
           <li>When the trader closes, the contract decrypts the position</li>
-          <li>P&L is calculated and distributed — you keep profit minus the trader's fee</li>
+          <li>P&L is calculated and distributed â€” you keep profit minus the trader's fee</li>
           <li>On a losing trade, the trader's stake is slashed to partially cover you</li>
         </ol>
       </div>
