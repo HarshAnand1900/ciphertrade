@@ -1,8 +1,9 @@
-"use client";
+﻿"use client";
 
 import { useState } from "react";
-import { useAccount, useWriteContract, useReadContract } from "wagmi";
+import { useAccount, useWriteContract, useReadContract, useWalletClient } from "wagmi";
 import { CIPHER_TRADE_ADDRESS, CIPHER_TRADE_ABI } from "@/lib/contract";
+import { createInstance, SepoliaConfig } from "@zama-fhe/relayer-sdk";
 
 export default function TraderPanel() {
   const { address } = useAccount();
@@ -12,8 +13,9 @@ export default function TraderPanel() {
   const [status, setStatus] = useState("");
 
   const { writeContractAsync } = useWriteContract();
+  const { data: walletClient } = useWalletClient();
 
-   const { data: positionData } = useReadContract({
+  const { data: positionData } = useReadContract({
     address: CIPHER_TRADE_ADDRESS,
     abi: CIPHER_TRADE_ABI,
     functionName: "getPosition",
@@ -39,14 +41,43 @@ export default function TraderPanel() {
 
   const isStaked = stakedBalance && BigInt(stakedBalance.toString()) > 0n;
 
-     async function handleOpenPosition() {
-    if (!size || isNaN(Number(size))) return;
+  async function handleOpenPosition() {
+    if (!size || isNaN(Number(size)) || !address || !walletClient) return;
     setLoading(true);
-    setStatus("This feature requires Sepolia deployment. Contract + FHE logic is ready.");
-    setTimeout(() => {
-      setLoading(false);
-      setStatus("Deploy to Sepolia to test live encryption.");
-    }, 1500);
+    try {
+      setStatus("Initializing FHE instance...");
+      const fhevm = await createInstance({
+        ...SepoliaConfig,
+        network: walletClient as Parameters<typeof createInstance>[0]["network"],
+      });
+
+      setStatus("Encrypting position...");
+      const sizeValue = BigInt(Math.floor(Number(size)));
+      const isLong = direction === "long";
+
+      const input = fhevm.createEncryptedInput(CIPHER_TRADE_ADDRESS, address);
+      input.addBool(isLong);
+      input.add64(sizeValue);
+      const encrypted = await input.encrypt();
+
+      setStatus("Sending transaction...");
+      await writeContractAsync({
+        address: CIPHER_TRADE_ADDRESS,
+        abi: CIPHER_TRADE_ABI,
+        functionName: "openPosition",
+        args: [
+          encrypted.handles[0],
+          encrypted.handles[1],
+          encrypted.inputProof,
+        ],
+      });
+
+      setStatus("Position opened - encrypted onchain!");
+      setSize("");
+    } catch (e: unknown) {
+      setStatus("Error: " + (e instanceof Error ? e.message : String(e)));
+    }
+    setLoading(false);
   }
 
   async function handleClose() {
@@ -82,17 +113,16 @@ export default function TraderPanel() {
 
   return (
     <div className="space-y-6">
-      {/* Status banner */}
       <div className={`rounded-xl p-4 border ${isOpen ? "bg-green-950 border-green-700" : "bg-gray-900 border-gray-800"}`}>
         <div className="flex items-center justify-between">
           <div>
             <div className="text-sm text-gray-400">Position Status</div>
             <div className={`text-lg font-semibold ${isOpen ? "text-green-400" : "text-gray-500"}`}>
-              {!!isOpen ? "🔐 Active — Encrypted Onchain" : "No Open Position"}
+              {!!isOpen ? "Active - Encrypted Onchain" : "No Open Position"}
             </div>
             {!!isOpen && positionData && (
               <div className="text-xs text-gray-500 mt-1">
-                Entry price: ${(Number((positionData as [unknown, bigint, boolean, boolean])[1]) / 1e6).toFixed(2)}
+                Entry price: {(Number((positionData as [unknown, bigint, boolean, boolean])[1]) / 1e6).toFixed(2)}
               </div>
             )}
           </div>
@@ -105,7 +135,6 @@ export default function TraderPanel() {
         </div>
       </div>
 
-      {/* Open position form */}
       {!isOpen && (
         <div className="bg-gray-900 rounded-xl p-6 border border-gray-800 space-y-4">
           <h2 className="font-semibold text-white">Open Encrypted Position</h2>
@@ -118,13 +147,13 @@ export default function TraderPanel() {
                 onClick={() => setDirection("long")}
                 className={`flex-1 py-3 rounded-lg font-medium transition-colors ${direction === "long" ? "bg-green-600 text-white" : "bg-gray-800 text-gray-400 hover:text-white"}`}
               >
-                LONG ↑
+                LONG
               </button>
               <button
                 onClick={() => setDirection("short")}
                 className={`flex-1 py-3 rounded-lg font-medium transition-colors ${direction === "short" ? "bg-red-600 text-white" : "bg-gray-800 text-gray-400 hover:text-white"}`}
               >
-                SHORT ↓
+                SHORT
               </button>
             </div>
           </div>
@@ -145,13 +174,12 @@ export default function TraderPanel() {
             disabled={loading || !size}
             className="w-full bg-indigo-600 hover:bg-indigo-500 disabled:bg-gray-700 disabled:text-gray-500 text-white font-medium py-3 rounded-lg transition-colors"
           >
-            {loading ? status || "Processing..." : "Encrypt & Open Position"}
+            {loading ? status || "Processing..." : "Encrypt and Open Position"}
           </button>
         </div>
       )}
 
-      {/* Close position */}
-      {!!isOpen &&(
+      {!!isOpen && (
         <div className="bg-gray-900 rounded-xl p-6 border border-gray-800">
           <h2 className="font-semibold text-white mb-2">Close Position</h2>
           <p className="text-xs text-gray-500 mb-4">Closing will mark your encrypted values as decryptable. Admin settles P&L and distributes to followers.</p>
@@ -165,12 +193,11 @@ export default function TraderPanel() {
         </div>
       )}
 
-      {/* Stake toggle */}
       <div className="bg-gray-900 rounded-xl p-6 border border-gray-800">
         <div className="flex items-center justify-between mb-3">
           <div>
             <h2 className="font-semibold text-white">Staking</h2>
-            <p className="text-xs text-gray-500 mt-1">Stake to earn 18% fee. Your stake is slashed proportionally on losing trades — prevents hedging abuse.</p>
+            <p className="text-xs text-gray-500 mt-1">Stake to earn 18% fee. Your stake is slashed proportionally on losing trades.</p>
           </div>
           <div className={`px-3 py-1 rounded-full text-xs font-medium ${isStaked ? "bg-indigo-900 text-indigo-300" : "bg-gray-800 text-gray-400"}`}>
             {isStaked ? "Staked" : "Unstaked"}

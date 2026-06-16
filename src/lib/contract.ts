@@ -1,4 +1,4 @@
-export const CIPHER_TRADE_ADDRESS = "0x0000000000000000000000000000000000000000"; // update after Sepolia deploy
+export const CIPHER_TRADE_ADDRESS = "0x5D8151A3c7378FA868bb7c1Ff5e9d47618A44abB"; // update after Sepolia deploy
 
 export const CIPHER_TRADE_ABI = [
   "function openPosition(bytes32 inputDirection, bytes32 inputSize, bytes calldata inputProof) external",
