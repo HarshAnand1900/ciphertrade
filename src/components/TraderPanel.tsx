@@ -46,7 +46,7 @@ export default function TraderPanel() {
     setLoading(true);
     try {
       setStatus("Initializing FHE instance...");
-      const { createInstance, SepoliaConfig } = await import("@zama-fhe/relayer-sdk");
+      const { createInstance, SepoliaConfig } = await import("@zama-fhe/relayer-sdk/web");
       const fhevm = await createInstance({
         ...SepoliaConfig,
         network: walletClient as Parameters<typeof createInstance>[0]["network"],
@@ -220,4 +220,5 @@ export default function TraderPanel() {
     </div>
   );
 }
+
 
