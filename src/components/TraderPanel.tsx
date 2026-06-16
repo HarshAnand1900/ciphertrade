@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { useAccount, useWriteContract, useReadContract, useWalletClient } from "wagmi";
 import { CIPHER_TRADE_ADDRESS, CIPHER_TRADE_ABI } from "@/lib/contract";
-import { createInstance, SepoliaConfig } from "@zama-fhe/relayer-sdk";
+
 
 export default function TraderPanel() {
   const { address } = useAccount();
@@ -46,6 +46,7 @@ export default function TraderPanel() {
     setLoading(true);
     try {
       setStatus("Initializing FHE instance...");
+      const { createInstance, SepoliaConfig } = await import("@zama-fhe/relayer-sdk");
       const fhevm = await createInstance({
         ...SepoliaConfig,
         network: walletClient as Parameters<typeof createInstance>[0]["network"],
@@ -219,3 +220,4 @@ export default function TraderPanel() {
     </div>
   );
 }
+
