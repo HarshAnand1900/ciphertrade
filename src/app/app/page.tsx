@@ -109,12 +109,59 @@ export default function AppPage() {
 // ═══════════════════════════════════════════════════════════════════════════════
 // CHART TAB
 // ═══════════════════════════════════════════════════════════════════════════════
+const TF_MAP: Record<string, string> = { "15m": "15m", "1H": "1h", "4H": "4h", "1D": "1d" };
+
 function ChartTab({ address }: { address: string }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [candles] = useState(() => genCandles(80));
-  const [price] = useState(candles[candles.length - 1].c);
+  const [candles, setCandles] = useState<Candle[]>(() => genCandles(80));
+  const [price, setPrice] = useState(candles[candles.length - 1]?.c ?? 3000);
   const [tf, setTf] = useState("1H");
   const animRef = useRef<number>(0);
+  const wsRef = useRef<WebSocket | null>(null);
+  const candlesRef = useRef<Candle[]>(candles);
+
+  // sync ref so drawChart always has latest candles
+  useEffect(() => { candlesRef.current = candles; }, [candles]);
+
+  // fetch historical candles from Binance REST
+  const fetchCandles = useCallback(async (interval: string) => {
+    try {
+      const res = await fetch(`https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval=${interval}&limit=100`);
+      const raw: [number, string, string, string, string, string][] = await res.json();
+      const cs: Candle[] = raw.map(k => ({ o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5], t: k[0] }));
+      setCandles(cs);
+      setPrice(cs[cs.length - 1].c);
+    } catch { /* keep fake candles on network error */ }
+  }, []);
+
+  // live price via Binance WebSocket miniTicker
+  const connectWs = useCallback(() => {
+    if (wsRef.current) wsRef.current.close();
+    const ws = new WebSocket("wss://stream.binance.com:9443/ws/ethusdt@miniTicker");
+    ws.onmessage = (e) => {
+      try {
+        const d = JSON.parse(e.data);
+        const livePrice = parseFloat(d.c);
+        setPrice(livePrice);
+        // update last candle's close in place
+        setCandles(prev => {
+          if (!prev.length) return prev;
+          const next = [...prev];
+          const last = { ...next[next.length - 1], c: livePrice, h: Math.max(next[next.length - 1].h, livePrice), l: Math.min(next[next.length - 1].l, livePrice) };
+          next[next.length - 1] = last;
+          return next;
+        });
+      } catch { /* ignore parse errors */ }
+    };
+    ws.onerror = () => ws.close();
+    wsRef.current = ws;
+  }, []);
+
+  useEffect(() => {
+    fetchCandles(TF_MAP[tf]);
+    connectWs();
+    return () => { wsRef.current?.close(); };
+  }, [tf, fetchCandles, connectWs]);
 
   // contract reads
   const { data: positionData } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getPosition", args: [address as `0x${string}`], query: { enabled: !!address } }) as { data: [bigint, bigint, boolean, boolean] | undefined };
@@ -160,7 +207,7 @@ function ChartTab({ address }: { address: string }) {
     const MT = 14, MR = 68, MB = 26, ML = 4, VOLH = Math.floor(H * 0.14);
     const CW = W - ML - MR, CH = H - MT - MB - VOLH - 6, CT = MT, CB = MT + CH, VT = CB + 6, VB = H - MB;
     const VISIBLE = 62;
-    const cs = candles.slice(-VISIBLE);
+    const cs = candlesRef.current.slice(-VISIBLE);
     if (!cs.length) return;
     const prices = cs.flatMap(c => [c.h, c.l]);
     let maxP = Math.max(...prices), minP = Math.min(...prices);
@@ -222,7 +269,7 @@ function ChartTab({ address }: { address: string }) {
     ctx.fillStyle = AMBER; rr(ctx, ML + CW + 1, cy3 - 10, MR - 2, 20, 5); ctx.fill();
     ctx.fillStyle = "#0c0a06"; ctx.font = `bold 10.5px ${MONO}`; ctx.textAlign = "center";
     ctx.fillText("$" + price.toFixed(2), ML + CW + 1 + (MR - 2) / 2, cy3 + 4);
-  }, [candles, price, position, encrypting, encFrame]);
+  }, [price, position, encrypting, encFrame]);
 
   useEffect(() => {
     const loop = () => {
@@ -270,10 +317,10 @@ function ChartTab({ address }: { address: string }) {
     setLoading(false);
   }
 
-  const last = candles[candles.length - 1];
-  const prev = candles[candles.length - 2];
-  const change24 = ((last.c - prev.o) / prev.o * 100).toFixed(2);
-  const isUp = last.c >= prev.o;
+  const last = candles[candles.length - 1] ?? { o: price, h: price, l: price, c: price, v: 0, t: 0 };
+  const prev = candles[candles.length - 2] ?? last;
+  const change24 = ((price - prev.o) / prev.o * 100).toFixed(2);
+  const isUp = price >= prev.o;
   const winRate = totalTrades > 0n ? Math.round(Number(wins) / Number(totalTrades) * 100) : 0;
 
   return (
@@ -286,7 +333,7 @@ function ChartTab({ address }: { address: string }) {
             <div style={{ width: 34, height: 34, borderRadius: 10, background: "linear-gradient(135deg,#627eea,#8b5cf6)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>Ξ</div>
             <div>
               <div style={{ fontSize: 15, fontWeight: 700 }}>ETH / USDT</div>
-              <div style={{ fontSize: 11, color: MUTED }}>Simulated · Sepolia</div>
+              <div style={{ fontSize: 11, color: MUTED }}>Binance Live · Sepolia</div>
             </div>
           </div>
           <div style={{ fontFamily: MONO, fontSize: 22, fontWeight: 700 }}>${price.toFixed(2)}</div>
@@ -304,7 +351,7 @@ function ChartTab({ address }: { address: string }) {
 
         {/* OHLC */}
         <div style={{ display: "flex", gap: 16, padding: "0 4px", fontSize: 11, fontFamily: MONO, color: MUTED }}>
-          {[["O", last.o], ["H", last.h], ["L", last.l], ["C", last.c]].map(([k, v]) => (
+          {[["O", last.o], ["H", Math.max(last.h, price)], ["L", Math.min(last.l, price)], ["C", price]].map(([k, v]) => (
             <span key={k as string}><span style={{ marginRight: 4 }}>{k}</span><span style={{ color: "#eef2f6" }}>${(v as number).toFixed(2)}</span></span>
           ))}
         </div>
