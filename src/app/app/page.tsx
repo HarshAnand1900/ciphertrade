@@ -1,10 +1,12 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, createContext, useContext } from "react";
 import { ConnectButton } from "@rainbow-me/rainbowkit";
-import { useAccount, useReadContract, useWriteContract, useWalletClient } from "wagmi";
+import { useAccount, useReadContract, useReadContracts, useWriteContract, useWalletClient, usePublicClient } from "wagmi";
 import Link from "next/link";
 import { CIPHER_TRADE_ADDRESS, CIPHER_TRADE_ABI } from "@/lib/contract";
+import { getFhevm, preloadFhevm, toHex } from "@/lib/fhe";
+import { decodeFunctionData, parseAbiItem } from "viem";
 
 // ─── tokens ───────────────────────────────────────────────────────────────────
 const MONO = "var(--font-jetbrains-mono), monospace";
@@ -27,30 +29,40 @@ interface Candle { o: number; h: number; l: number; c: number; v: number; t: num
 
 const TF_MAP: Record<string, string> = { "15m": "15m", "1H": "1h", "4H": "4h", "1D": "1d" };
 
+// ─── mock traders shown when contract has no registered traders ────────────────
+const MOCK_TRADERS = [
+  { addr: "0xA1c4b2e3f4d5c6e7f8a9b0c1d2e3f4b9F2", name: "DeltaNeutral", total: 210n, wins: 164n, pnlBps: 2410n, followers: 19n, posOpen: false },
+  { addr: "0x7Bd1a2b3c4d5e6f7a8b9c0d1e2f3a4cE04", name: "Satoshi_Long",  total: 142n, wins: 101n, pnlBps: 1840n, followers: 12n, posOpen: true  },
+  { addr: "0x3Fe9b2c3d4e5f6a7b8c9d0e1f2a3b4d11a", name: "VolHunter",     total: 88n,  wins: 54n,  pnlBps: 920n,  followers: 7n,  posOpen: false },
+  { addr: "0x9Cc2a3b4c5d6e7f8a9b0c1d2e3f4a5b7ab8", name: "NightOwl",    total: 33n,  wins: 15n,  pnlBps: -230n, followers: 4n,  posOpen: false },
+  { addr: "0xBf22a3b4c5d6e7f8a9b0c1d2e3f4a5b3019", name: "AlphaSeeker", total: 67n,  wins: 44n,  pnlBps: 1180n, followers: 9n,  posOpen: true  },
+  { addr: "0x5Dc9a3b4c5d6e7f8a9b0c1d2e3f4a5b4ca7", name: "EchoChamber", total: 19n,  wins: 10n,  pnlBps: 410n,  followers: 3n,  posOpen: false },
+];
+
 function fmt(addr: string) { return addr.slice(0, 6) + "…" + addr.slice(-4); }
 function initial(addr: string) { return addr.slice(2, 3).toUpperCase(); }
 
-function genCandles(n: number): Candle[] {
-  const cs: Candle[] = []; let price = 3000;
-  const now = Date.now();
-  for (let i = 0; i < n; i++) {
-    const b = Math.random() > 0.47 ? 1 : -1;
-    const move = (Math.random() * 28 + 2) * b;
-    const close = Math.max(2400, Math.min(4000, price + move));
-    const wick = Math.random() * 12;
-    cs.push({ o: price, h: Math.max(price, close) + wick, l: Math.min(price, close) - wick, c: close, v: 600 + Math.random() * 2400, t: now - (n - i) * 3600000 });
-    price = close;
-  }
-  return cs;
+// Profile overlay: any trader row can call openProfile(addr) to open it.
+const ProfileContext = createContext<(addr: string) => void>(() => {});
+function useOpenProfile() { return useContext(ProfileContext); }
+
+// Reads an on-chain username for an address, falling back to a mock name or short address.
+// Only use this where a single standalone lookup is needed (e.g. ProfileOverlay).
+// In list contexts (Leaderboard, Discover, Following) batch-read at the parent instead.
+function useTraderName(addr?: string, mockName?: string): string {
+  const { data } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "usernames", args: [addr as `0x${string}`], query: { enabled: !!addr && !mockName, staleTime: 60_000 } }) as { data: string | undefined };
+  if (mockName) return mockName;
+  if (data && data.length > 0) return data;
+  return addr ? fmt(addr) : "";
 }
 
-function rr(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
-  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.lineTo(x + w - r, y);
-  ctx.quadraticCurveTo(x + w, y, x + w, y + r); ctx.lineTo(x + w, y + h - r);
-  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h); ctx.lineTo(x + r, y + h);
-  ctx.quadraticCurveTo(x, y + h, x, y + h - r); ctx.lineTo(x, y + r);
-  ctx.quadraticCurveTo(x, y, x + r, y); ctx.closePath();
+function resolvedName(raw: string | undefined, addr: string): string {
+  if (raw && raw.length > 0) return raw;
+  return fmt(addr);
 }
+
+
+
 
 // ─── App shell ────────────────────────────────────────────────────────────────
 export default function AppPage() {
@@ -58,7 +70,11 @@ export default function AppPage() {
   const [tab, setTab] = useState<Tab>("chart");
   const [livePrice, setLivePrice] = useState(3000);
   const [prevOpen, setPrevOpen] = useState(3000);
+  const [profileAddr, setProfileAddr] = useState<string | null>(null);
   const headerWsRef = useRef<WebSocket | null>(null);
+
+  // warm up the FHE SDK/WASM in the background so the first trade is fast
+  useEffect(() => { if (isConnected) preloadFhevm(); }, [isConnected]);
 
   // lightweight WebSocket for header price ticker only
   useEffect(() => {
@@ -84,7 +100,9 @@ export default function AppPage() {
   const tabs: Tab[] = ["chart", "discover", "following", "portfolio", "leaderboard"];
 
   return (
+    <ProfileContext.Provider value={setProfileAddr}>
     <div style={{ minHeight: "100vh", background: BG, color: "#eef2f6", fontFamily: SANS, display: "flex", flexDirection: "column" }}>
+      {profileAddr && <ProfileOverlay addr={profileAddr} livePrice={livePrice} onClose={() => setProfileAddr(null)} />}
       {/* ── header ── */}
       <div style={{ height: 52, borderBottom: `1px solid ${BORDER2}`, background: "#0c1017", display: "flex", alignItems: "center", padding: "0 18px", gap: 0, flexShrink: 0 }}>
         <Link href="/" style={{ display: "flex", alignItems: "center", gap: 9, textDecoration: "none", color: "inherit", marginRight: 20, flexShrink: 0 }}>
@@ -134,6 +152,148 @@ export default function AppPage() {
         </div>
       )}
     </div>
+    </ProfileContext.Provider>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROFILE OVERLAY — public track record for any trader (opened by addr/username)
+// ═══════════════════════════════════════════════════════════════════════════════
+function ProfileOverlay({ addr, livePrice, onClose }: { addr: string; livePrice: number; onClose: () => void }) {
+  const name = useTraderName(addr);
+  const { data: stats } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "traderStats", args: [addr as `0x${string}`], query: {} }) as { data: [bigint, bigint, bigint] | undefined };
+  const { data: fCount } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getFollowerCount", args: [addr as `0x${string}`], query: {} }) as { data: bigint | undefined };
+  const { data: posOpen } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "isPositionOpen", args: [addr as `0x${string}`], query: {} }) as { data: boolean | undefined };
+  const { data: history } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getTradeHistory", args: [addr as `0x${string}`], query: {} }) as { data: readonly { entryPrice: bigint; exitPrice: bigint; direction: boolean; size: bigint; leverage: bigint; pnlBps: bigint; timestamp: bigint }[] | undefined };
+
+  const [total, wins, pnlBps] = stats ?? [0n, 0n, 0n];
+  const winRate = total > 0n ? Math.round(Number(wins) / Number(total) * 100) : 0;
+  const net = Number(pnlBps) / 100;
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(4,5,7,.7)", backdropFilter: "blur(4px)", zIndex: 100, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div onClick={e => e.stopPropagation()} style={{ width: "100%", maxWidth: 640, maxHeight: "86vh", overflowY: "auto", background: "#0d1218", border: `1px solid ${BORDER}`, borderRadius: 16, padding: 22 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 18 }}>
+          <div style={{ width: 54, height: 54, borderRadius: 14, background: "linear-gradient(135deg,#f59e0b,#fbbf24)", display: "flex", alignItems: "center", justifyContent: "center", color: "#0c0a06", fontWeight: 700, fontSize: 24 }}>{name[0]?.toUpperCase()}</div>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 20, fontWeight: 700 }}>{name}</div>
+            <div style={{ fontSize: 11, color: MUTED2, fontFamily: MONO }}>{addr}</div>
+          </div>
+          {posOpen && <span style={{ fontSize: 11, padding: "4px 10px", borderRadius: 6, background: "rgba(34,197,94,.12)", color: GREEN, border: "1px solid rgba(34,197,94,.25)" }}>LIVE 🔒</span>}
+          <button onClick={onClose} style={{ background: INNER, border: `1px solid ${BORDER}`, color: MUTED2, borderRadius: 8, width: 30, height: 30, cursor: "pointer", fontSize: 16 }}>×</button>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 8, marginBottom: 20 }}>
+          {[
+            { label: "Settled", value: total.toString(), color: "#eef2f6" },
+            { label: "Win rate", value: total > 0n ? winRate + "%" : "—", color: "#fbbf24" },
+            { label: "Net P&L", value: (net >= 0 ? "+" : "") + net.toFixed(1) + "%", color: net >= 0 ? GREEN : RED_SOFT },
+            { label: "Followers", value: Number(fCount ?? 0n) + "/20", color: AMBER },
+          ].map(s => (
+            <div key={s.label} style={{ background: INNER, borderRadius: 10, padding: 12 }}>
+              <div style={{ fontSize: 9, color: MUTED2, marginBottom: 3 }}>{s.label}</div>
+              <div style={{ fontSize: 19, fontWeight: 700, fontFamily: MONO, color: s.color }}>{s.value}</div>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ fontSize: 13, fontWeight: 600, color: "#aeb8c4", marginBottom: 10 }}>Public track record</div>
+        {!history || history.length === 0 ? (
+          <div style={{ padding: "20px 0", color: MUTED2, fontSize: 12, textAlign: "center" }}>No settled trades yet</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {[...history].reverse().map((tr, i) => {
+              const pnl = Number(tr.pnlBps) / 100;
+              return (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: 12, background: INNER, borderRadius: 8, padding: "9px 12px", fontSize: 12, fontFamily: MONO }}>
+                  <span style={{ color: tr.direction ? GREEN : RED, minWidth: 52 }}>{tr.direction ? "▲ LONG" : "▼ SHORT"}</span>
+                  <span style={{ color: MUTED2 }}>{tr.size.toString()}u · {tr.leverage.toString()}×</span>
+                  <span style={{ color: MUTED2 }}>${(Number(tr.entryPrice) / 1e6).toFixed(0)} → ${(Number(tr.exitPrice) / 1e6).toFixed(0)}</span>
+                  <span style={{ marginLeft: "auto", color: pnl >= 0 ? GREEN : RED_SOFT, fontWeight: 700 }}>{pnl >= 0 ? "+" : ""}{pnl.toFixed(1)}%</span>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        <div style={{ marginTop: 16, fontSize: 10.5, color: MUTED2, fontFamily: MONO, textAlign: "center" }}>
+          Live positions stay encrypted · only settled trades are public · mark ${livePrice.toFixed(0)}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ENCRYPTION PROOF — pulls your real openPosition tx and shows what the chain stored
+// ═══════════════════════════════════════════════════════════════════════════════
+function EncryptionProof({ address, onClose }: { address: string; onClose: () => void }) {
+  const publicClient = usePublicClient();
+  const [state, setState] = useState<"loading" | "none" | "ready">("loading");
+  const [txHash, setTxHash] = useState<string>("");
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const [args, setArgs] = useState<any[]>([]);
+
+  useEffect(() => {
+    (async () => {
+      if (!publicClient) return;
+      try {
+        const latest = await publicClient.getBlockNumber();
+        const logs = await publicClient.getLogs({
+          address: CIPHER_TRADE_ADDRESS,
+          event: parseAbiItem("event PositionOpened(address indexed trader, uint256 entryPrice)"),
+          args: { trader: address as `0x${string}` },
+          fromBlock: latest > 50000n ? latest - 50000n : 0n,
+          toBlock: latest,
+        });
+        if (!logs.length) { setState("none"); return; }
+        const hash = logs[logs.length - 1].transactionHash;
+        const tx = await publicClient.getTransaction({ hash });
+        const decoded = decodeFunctionData({ abi: CIPHER_TRADE_ABI, data: tx.input });
+        setTxHash(hash);
+        setArgs(decoded.args as unknown as unknown[]);
+        setState("ready");
+      } catch { setState("none"); }
+    })();
+  }, [publicClient, address]);
+
+  const short = (h: string) => h.slice(0, 22) + "…" + h.slice(-8);
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(4,5,7,.75)", backdropFilter: "blur(4px)", zIndex: 120, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div onClick={e => e.stopPropagation()} style={{ width: "100%", maxWidth: 680, background: "#0d1218", border: `1px solid ${BORDER}`, borderRadius: 16, padding: 24 }}>
+        <div style={{ display: "flex", alignItems: "center", marginBottom: 6 }}>
+          <div style={{ fontSize: 18, fontWeight: 700 }}>🔒 Proof of encryption</div>
+          <button onClick={onClose} style={{ marginLeft: "auto", background: INNER, border: `1px solid ${BORDER}`, color: MUTED2, borderRadius: 8, width: 30, height: 30, cursor: "pointer", fontSize: 16 }}>×</button>
+        </div>
+        <div style={{ fontSize: 12.5, color: MUTED, lineHeight: 1.55, marginBottom: 18 }}>
+          This is the <b style={{ color: "#eef2f6" }}>actual data your last trade wrote to the public blockchain</b>, read back live. Notice the direction, size and leverage are unreadable ciphertext — the values you typed appear nowhere.
+        </div>
+
+        {state === "loading" && <div style={{ color: MUTED2, fontSize: 13, padding: "20px 0", textAlign: "center" }}>Reading your transaction from chain…</div>}
+        {state === "none" && <div style={{ color: MUTED2, fontSize: 13, padding: "20px 0", textAlign: "center" }}>No openPosition transaction found yet. Open a position first, then come back.</div>}
+        {state === "ready" && (
+          <>
+            {[
+              { label: "Direction (long/short)", val: args[0] as string, enc: true },
+              { label: "Size (units)", val: args[1] as string, enc: true },
+              { label: "Leverage (1×–20×)", val: args[2] as string, enc: true },
+              { label: "Entry price (public by design)", val: "$" + (Number(args[4]) / 1e6).toFixed(2), enc: false },
+            ].map(r => (
+              <div key={r.label} style={{ display: "flex", alignItems: "center", gap: 12, background: INNER, borderRadius: 9, padding: "11px 14px", marginBottom: 8 }}>
+                <div style={{ minWidth: 200 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600 }}>{r.label}</div>
+                  <div style={{ fontSize: 10, color: r.enc ? "#fbbf24" : GREEN, fontFamily: MONO, marginTop: 2 }}>{r.enc ? "🔒 ENCRYPTED CIPHERTEXT" : "● public"}</div>
+                </div>
+                <div style={{ flex: 1, fontFamily: MONO, fontSize: 12, color: r.enc ? "#7d8896" : "#eef2f6", wordBreak: "break-all", textAlign: "right" }}>{r.enc ? short(r.val) : r.val}</div>
+              </div>
+            ))}
+            <a href={`https://sepolia.etherscan.io/tx/${txHash}#statechange`} target="_blank" rel="noreferrer" style={{ display: "block", marginTop: 14, fontSize: 12, fontFamily: MONO, color: AMBER, textAlign: "center", textDecoration: "underline" }}>
+              verify this exact transaction on Etherscan ↗
+            </a>
+          </>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -141,37 +301,44 @@ export default function AppPage() {
 // CHART TAB
 // ═══════════════════════════════════════════════════════════════════════════════
 function ChartTab({ address, livePrice }: { address: string; livePrice: number }) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [candles, setCandles] = useState<Candle[]>(() => genCandles(80));
+  const chartContainerRef = useRef<HTMLDivElement>(null);
+  const [candles, setCandles] = useState<Candle[]>([]);
   const [tf, setTf] = useState("1H");
-  const animRef = useRef<number>(0);
   const wsRef = useRef<WebSocket | null>(null);
-  const candlesRef = useRef<Candle[]>(candles);
-  const priceRef = useRef(livePrice);
-
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const seriesRef = useRef<any>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const chartRef = useRef<any>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const entryLineRef = useRef<any>(null);
+  const freshRef = useRef(false);          // true only right after a full REST load
+  const candlesRef = useRef<Candle[]>([]);
   useEffect(() => { candlesRef.current = candles; }, [candles]);
-  useEffect(() => { priceRef.current = livePrice; }, [livePrice]);
 
   const fetchCandles = useCallback(async (interval: string) => {
     try {
       const res = await fetch(`https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval=${interval}&limit=100`);
       const raw: [number, string, string, string, string, string][] = await res.json();
       const cs: Candle[] = raw.map(k => ({ o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5], t: k[0] }));
+      freshRef.current = true;
       setCandles(cs);
     } catch { /* keep fake */ }
   }, []);
 
   const connectWs = useCallback(() => {
     if (wsRef.current) wsRef.current.close();
-    const ws = new WebSocket("wss://stream.binance.com:9443/ws/ethusdt@miniTicker");
+    const ws = new WebSocket("wss://stream.binance.com:9443/ws/ethusdt@kline_" + TF_MAP[tf]);
     ws.onmessage = (e) => {
       try {
         const d = JSON.parse(e.data);
-        const p = parseFloat(d.c);
+        const k = d.k;
+        if (!k) return;
+        const bar = { time: Math.floor(k.t / 1000) as number, open: +k.o, high: +k.h, low: +k.l, close: +k.c };
+        seriesRef.current?.update(bar);
         setCandles(prev => {
           if (!prev.length) return prev;
           const next = [...prev];
-          const last = { ...next[next.length - 1], c: p, h: Math.max(next[next.length - 1].h, p), l: Math.min(next[next.length - 1].l, p) };
+          const last = { ...next[next.length - 1], c: +k.c, h: +k.h, l: +k.l };
           next[next.length - 1] = last;
           return next;
         });
@@ -179,7 +346,7 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
     };
     ws.onerror = () => ws.close();
     wsRef.current = ws;
-  }, []);
+  }, [tf]);
 
   useEffect(() => {
     fetchCandles(TF_MAP[tf]);
@@ -188,12 +355,13 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
   }, [tf, fetchCandles, connectWs]);
 
   // contract reads
-  const { data: positionData } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getPosition", args: [address as `0x${string}`], query: { enabled: !!address } }) as { data: [bigint, bigint, boolean, boolean] | undefined };
-  const { data: isOpen, refetch: refetchOpen } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "isPositionOpen", args: [address as `0x${string}`], query: { enabled: !!address } }) as { data: boolean | undefined; refetch: () => void };
-  const { data: stakedBalance, refetch: refetchStake } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "stakedBalance", args: [address as `0x${string}`], query: { enabled: !!address } }) as { data: bigint | undefined; refetch: () => void };
-  const { data: followerCount } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getFollowerCount", args: [address as `0x${string}`], query: { enabled: !!address } }) as { data: bigint | undefined };
+  const { data: positionData, refetch: refetchPosition } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getPosition", args: [address as `0x${string}`], query: { enabled: !!address, staleTime: 10_000 } }) as { data: [bigint, bigint, boolean, boolean] | undefined; refetch: () => void };
+  const { data: isOpen, refetch: refetchOpen } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "isPositionOpen", args: [address as `0x${string}`], query: { enabled: !!address, staleTime: 10_000 } }) as { data: boolean | undefined; refetch: () => void };
+  const { data: stakedFlag, refetch: refetchStake } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "staked", args: [address as `0x${string}`], query: { enabled: !!address, staleTime: 30_000 } }) as { data: boolean | undefined; refetch: () => void };
+  const { data: followerCount } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getFollowerCount", args: [address as `0x${string}`], query: { enabled: !!address, staleTime: 30_000 } }) as { data: bigint | undefined };
 
-  const isStaked = !!(stakedBalance && stakedBalance > 0n);
+  const refetchAll = useCallback(() => { refetchOpen(); refetchStake(); refetchPosition(); }, [refetchOpen, refetchStake, refetchPosition]);
+  const isStaked = !!stakedFlag;
   const entryPrice = positionData ? Number(positionData[1]) / 1e6 : 0;
   const fCount = Number(followerCount ?? 0n);
 
@@ -205,136 +373,102 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
   // form state
   const [dir, setDir] = useState<Dir>("LONG");
   const [size, setSize] = useState("2500");
+  const [lev, setLev] = useState(2); // leverage 1x–10x (encrypted)
   const [loading, setLoading] = useState(false);
   const [statusMsg, setStatusMsg] = useState("");
   const [statusOk, setStatusOk] = useState(false);
   const [encrypting, setEncrypting] = useState(false);
-  const [encFrame, setEncFrame] = useState(0);
+  const [showProof, setShowProof] = useState(false);
 
   const { writeContractAsync } = useWriteContract();
   const { data: walletClient } = useWalletClient();
+  const publicClient = usePublicClient();
 
   function setErr(m: string) { setStatusMsg(m); setStatusOk(false); }
   function setOk(m: string) { setStatusMsg(m); setStatusOk(true); }
 
-  // draw
-  const drawChart = useCallback(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const rect = canvas.getBoundingClientRect();
-    const W = rect.width, H = rect.height;
-    if (!W || !H) return;
-    if (canvas.width !== Math.round(W * dpr) || canvas.height !== Math.round(H * dpr)) {
-      canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
-    }
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    const price = priceRef.current;
-    const MT = 14, MR = 68, MB = 26, ML = 4, VOLH = Math.floor(H * 0.14);
-    const CW = W - ML - MR, CH = H - MT - MB - VOLH - 6, CT = MT, CB = MT + CH, VT = CB + 6, VB = H - MB;
-    const VISIBLE = 62;
-    const cs = candlesRef.current.slice(-VISIBLE);
-    if (!cs.length) return;
-    const prices = cs.flatMap(c => [c.h, c.l]);
-    let maxP = Math.max(...prices), minP = Math.min(...prices);
-    const pad = (maxP - minP) * 0.08; maxP += pad; minP -= pad;
-    const maxV = Math.max(...cs.map(c => c.v));
-    const py = (p: number) => CT + CH * (1 - (p - minP) / (maxP - minP));
-    const cx = (i: number) => ML + (i + 0.5) * (CW / VISIBLE);
-    const cw2 = CW / VISIBLE, bw = Math.max(1, cw2 * 0.68);
-    ctx.fillStyle = "#0c1017"; ctx.fillRect(0, 0, W, H);
-    for (let i = 0; i <= 5; i++) {
-      const p = minP + (maxP - minP) * (i / 5), y = py(p);
-      ctx.strokeStyle = "#161e28"; ctx.lineWidth = 1;
-      ctx.beginPath(); ctx.moveTo(ML, y); ctx.lineTo(ML + CW, y); ctx.stroke();
-      ctx.fillStyle = "#3d4a58"; ctx.font = `9.5px ${MONO}`; ctx.textAlign = "left";
-      ctx.fillText("$" + Math.round(p), ML + CW + 5, y + 3.5);
-    }
-    cs.forEach((c, i) => {
-      ctx.fillStyle = c.c >= c.o ? "rgba(34,197,94,.25)" : "rgba(239,68,68,.25)";
-      ctx.fillRect(cx(i) - bw / 2, VT + (VB - VT) * (1 - c.v / maxV), bw, (VB - VT) * c.v / maxV);
-    });
-    cs.forEach((c, i) => {
-      const up = c.c >= c.o, col = up ? "#22c55e" : "#ef4444", x2 = cx(i);
-      ctx.strokeStyle = up ? "rgba(34,197,94,.65)" : "rgba(239,68,68,.65)"; ctx.lineWidth = 1;
-      ctx.beginPath(); ctx.moveTo(x2, py(c.h)); ctx.lineTo(x2, py(c.l)); ctx.stroke();
-      ctx.fillStyle = col; ctx.globalAlpha = 0.85;
-      ctx.fillRect(x2 - bw / 2, Math.min(py(c.o), py(c.c)), bw, Math.max(1.5, Math.abs(py(c.o) - py(c.c))));
-      ctx.globalAlpha = 1;
-    });
-    if (isOpen && entryPrice > 0) {
-      const ey = py(entryPrice), cy2 = py(price);
-      const inProfit = price > entryPrice;
-      const zT = Math.min(ey, cy2), zB = Math.max(ey, cy2);
-      ctx.save();
-      ctx.fillStyle = inProfit ? "rgba(34,197,94,.06)" : "rgba(239,68,68,.06)";
-      ctx.fillRect(ML, zT, CW, zB - zT);
-      ctx.strokeStyle = inProfit ? "rgba(34,197,94,.1)" : "rgba(239,68,68,.1)"; ctx.lineWidth = 1;
-      for (let x3 = ML; x3 < ML + CW; x3 += 14) { ctx.beginPath(); ctx.moveTo(x3, zT); ctx.lineTo(x3 + 10, zB); ctx.stroke(); }
-      ctx.restore();
-      ctx.strokeStyle = "rgba(251,191,36,.5)"; ctx.lineWidth = 1; ctx.setLineDash([5, 5]);
-      ctx.beginPath(); ctx.moveTo(ML, ey); ctx.lineTo(ML + CW, ey); ctx.stroke(); ctx.setLineDash([]);
-      ctx.fillStyle = "#1a1606"; ctx.strokeStyle = "#6b5320"; ctx.lineWidth = 1;
-      rr(ctx, ML + 10, ey - 16, 172, 16, 4); ctx.fill(); ctx.stroke();
-      ctx.fillStyle = "#fbbf24"; ctx.font = `9.5px ${MONO}`; ctx.textAlign = "left";
-      ctx.fillText("🔒 SEALED ENTRY · $" + entryPrice.toFixed(2), ML + 16, ey - 4);
-      ctx.fillStyle = "#6b5320";
-      rr(ctx, ML + CW + 1, ey - 9, MR - 2, 17, 4); ctx.fill();
-      ctx.fillStyle = "#fbbf24"; ctx.font = `bold 9.5px ${MONO}`; ctx.textAlign = "center";
-      ctx.fillText("$" + entryPrice.toFixed(0), ML + CW + 1 + (MR - 2) / 2, ey + 4);
-    }
-    if (encrypting) {
-      const HX = "0123456789ABCDEF";
-      ctx.globalAlpha = 0.45; ctx.font = `10px ${MONO}`; ctx.textAlign = "left";
-      for (let row = 0; row < 8; row++) for (let col = 0; col < 14; col++) {
-        const seed = (encFrame + row * 7 + col * 13) % 16;
-        ctx.fillStyle = row % 2 === 0 ? "rgba(251,191,36,.6)" : "rgba(91,97,104,.5)";
-        ctx.fillText("0x" + HX[seed] + HX[(seed + 5) % 16], ML + col * (CW / 14), CT + 20 + row * 32);
-      }
-      ctx.globalAlpha = 1;
-    }
-    const cy3 = py(price);
-    ctx.strokeStyle = AMBER; ctx.lineWidth = 1.2; ctx.setLineDash([4, 4]);
-    ctx.beginPath(); ctx.moveTo(ML, cy3); ctx.lineTo(ML + CW, cy3); ctx.stroke(); ctx.setLineDash([]);
-    ctx.fillStyle = AMBER; rr(ctx, ML + CW + 1, cy3 - 10, MR - 2, 20, 5); ctx.fill();
-    ctx.fillStyle = "#0c0a06"; ctx.font = `bold 10.5px ${MONO}`; ctx.textAlign = "center";
-    ctx.fillText("$" + price.toFixed(2), ML + CW + 1 + (MR - 2) / 2, cy3 + 4);
-    // time labels
-    ctx.fillStyle = "#3d4a58"; ctx.font = `9px ${MONO}`; ctx.textAlign = "center";
-    [0, 15, 30, 45, 61].forEach(i => {
-      if (i < cs.length) {
-        const d = new Date(cs[i].t);
-        ctx.fillText(`${d.getHours()}:${String(d.getMinutes()).padStart(2, "0")}`, cx(i), H - MB + 14);
-      }
-    });
-  }, [isOpen, entryPrice, encrypting, encFrame]);
-
+  // init lightweight-charts
   useEffect(() => {
-    const loop = () => {
-      if (encrypting) setEncFrame(f => f + 1);
-      drawChart();
-      animRef.current = requestAnimationFrame(loop);
-    };
-    animRef.current = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(animRef.current);
-  }, [drawChart, encrypting]);
+    if (!chartContainerRef.current) return;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let chart: any = null;
+    let ro: ResizeObserver | null = null;
+    import("lightweight-charts").then(({ createChart, CrosshairMode, CandlestickSeries }) => {
+      const el = chartContainerRef.current;
+      if (!el) return;
+      const w = el.offsetWidth || 600;
+      const h = el.offsetHeight || 400;
+      chart = createChart(el, {
+        width: w, height: h,
+        layout: { background: { color: "#0c1017" }, textColor: "#5b6168" },
+        grid: { vertLines: { color: "#161e28" }, horzLines: { color: "#161e28" } },
+        crosshair: { mode: CrosshairMode.Normal },
+        rightPriceScale: { borderColor: "#1e2a36", textColor: "#5b6168" },
+        timeScale: { borderColor: "#1e2a36", timeVisible: true, secondsVisible: false },
+        handleScroll: true, handleScale: true,
+      });
+      const series = chart.addSeries(CandlestickSeries, {
+        upColor: "#22c55e", downColor: "#ef4444",
+        borderUpColor: "#22c55e", borderDownColor: "#ef4444",
+        wickUpColor: "#22c55e", wickDownColor: "#ef4444",
+      });
+      chartRef.current = chart;
+      seriesRef.current = series;
+      // if candles already loaded before the chart was ready, paint them once
+      if (candlesRef.current.length) {
+        series.setData(candlesRef.current.map(c => ({ time: Math.floor(c.t / 1000) as number, open: c.o, high: c.h, low: c.l, close: c.c })));
+        chart.timeScale().fitContent();
+        freshRef.current = false;
+      }
+      ro = new ResizeObserver(() => {
+        const c = chartContainerRef.current;
+        if (c && chart) chart.applyOptions({ width: c.offsetWidth, height: c.offsetHeight });
+      });
+      ro.observe(el);
+    });
+    return () => { ro?.disconnect(); chart?.remove(); chartRef.current = null; seriesRef.current = null; };
+  }, []);
+
+  // push candles into chart ONLY on a fresh REST load (timeframe change / first load).
+  // WS price ticks update the last candle in-place via series.update() and must NOT
+  // reset the user's pan/zoom — so we skip setData/fitContent for those.
+  useEffect(() => {
+    if (!seriesRef.current || !candles.length || !freshRef.current) return;
+    freshRef.current = false;
+    const bars = candles.map(c => ({ time: Math.floor(c.t / 1000) as number, open: c.o, high: c.h, low: c.l, close: c.c }));
+    seriesRef.current.setData(bars);
+    chartRef.current?.timeScale().fitContent();
+  }, [candles]);
+
+  // entry price line
+  useEffect(() => {
+    if (!seriesRef.current) return;
+    if (entryLineRef.current) { seriesRef.current.removePriceLine(entryLineRef.current); entryLineRef.current = null; }
+    if (isOpen && entryPrice > 0) {
+      entryLineRef.current = seriesRef.current.createPriceLine({
+        price: entryPrice, color: "#fbbf24", lineWidth: 1, lineStyle: 1,
+        axisLabelVisible: true, title: "🔒 Entry",
+      });
+    }
+  }, [isOpen, entryPrice]);
 
   async function handleOpen() {
     if (!size || !walletClient) return;
     setLoading(true); setStatusMsg(""); setEncrypting(true);
     try {
       setStatusMsg("Initializing FHE…");
-      const { createInstance, SepoliaConfig } = await import("@zama-fhe/relayer-sdk/web");
-      const fhevm = await createInstance({ ...SepoliaConfig, network: walletClient as Parameters<typeof createInstance>[0]["network"] });
+      const fhevm = await getFhevm(); // cached/preloaded singleton
       setStatusMsg("Encrypting…");
       const input = fhevm.createEncryptedInput(CIPHER_TRADE_ADDRESS, address);
-      input.addBool(dir === "LONG"); input.add64(BigInt(Math.floor(Number(size))));
+      input.addBool(dir === "LONG"); input.add64(BigInt(Math.floor(Number(size)))); input.add64(BigInt(lev));
       const encrypted = await input.encrypt();
       setStatusMsg("Broadcasting…");
-      await writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "openPosition", args: [encrypted.handles[0], encrypted.handles[1], encrypted.inputProof] });
-      setOk("Position sealed on-chain."); setSize("2500"); refetchOpen();
+      // snapshot the live ETH price (6 decimals) as the on-chain entry price
+      const price6 = BigInt(Math.round(livePrice * 1e6));
+      const hash = await writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "openPosition", args: [toHex(encrypted.handles[0]), toHex(encrypted.handles[1]), toHex(encrypted.handles[2]), toHex(encrypted.inputProof), price6] });
+      setStatusMsg("Confirming…");
+      await publicClient?.waitForTransactionReceipt({ hash });
+      setOk("Position sealed on-chain."); refetchAll();
     } catch (e: unknown) { setErr((e instanceof Error ? e.message.slice(0, 100) : String(e))); }
     setEncrypting(false); setLoading(false);
   }
@@ -342,8 +476,11 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
   async function handleClose() {
     setLoading(true); setStatusMsg("Closing…");
     try {
-      await writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "closePosition" });
-      setOk("Position closed. Awaiting KMS settlement."); refetchOpen();
+      const price6 = BigInt(Math.round(livePrice * 1e6));
+      const hash = await writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "closePosition", args: [price6] });
+      setStatusMsg("Confirming…");
+      await publicClient?.waitForTransactionReceipt({ hash });
+      setOk("Position closed. Awaiting KMS settlement."); refetchAll();
     } catch (e: unknown) { setErr((e instanceof Error ? e.message.slice(0, 100) : String(e))); }
     setLoading(false);
   }
@@ -351,7 +488,8 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
   async function handleStake() {
     setLoading(true);
     try {
-      await writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: isStaked ? "unstake" : "stake" });
+      const hash = await writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: isStaked ? "unstake" : "stake" });
+      await publicClient?.waitForTransactionReceipt({ hash });
       setOk(isStaked ? "Unstaked." : "Staked. 18% fee enabled."); refetchStake();
     } catch (e: unknown) { setErr((e instanceof Error ? e.message.slice(0, 100) : String(e))); }
     setLoading(false);
@@ -365,12 +503,16 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
   const change24 = ((livePrice - first24.o) / first24.o * 100).toFixed(2);
   const isUp = livePrice >= first24.o;
 
-  // fake cipher for mempool strip
-  const cipherA = "0x2e7c5d9a" + Math.random().toString(16).slice(2, 6) + "…";
-  const cipherB = "0x1f9e4c7a" + Math.random().toString(16).slice(2, 6) + "…";
+  // REAL on-chain ciphertext handle for the mempool strip (the encrypted size euint64).
+  // When no position is open we show a placeholder.
+  const sizeHandle = positionData?.[0] ? (positionData[0] as unknown as string) : null;
+  const cipherSize = sizeHandle && sizeHandle !== "0x0000000000000000000000000000000000000000000000000000000000000000"
+    ? sizeHandle.slice(0, 14) + "…" + sizeHandle.slice(-6)
+    : "— no open position";
 
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0, overflow: "hidden" }}>
+      {showProof && <EncryptionProof address={address} onClose={() => setShowProof(false)} />}
       {/* pair strip */}
       <div style={{ height: 38, borderBottom: `1px solid ${BORDER2}`, background: "#0c1017", display: "flex", alignItems: "center", padding: "0 18px", gap: 0, flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginRight: 18, flexShrink: 0 }}>
@@ -417,9 +559,9 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
             </div>
           </div>
 
-          {/* canvas */}
-          <div style={{ position: "relative", flex: 1, minHeight: 0, background: "#0c1017", border: `1px solid ${BORDER}`, borderRadius: 12, overflow: "hidden" }}>
-            <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block" }} />
+          {/* chart */}
+          <div style={{ position: "relative", flex: 1, minHeight: 320, border: `1px solid ${BORDER}`, borderRadius: 12, overflow: "hidden" }}>
+            <div ref={chartContainerRef} style={{ width: "100%", height: "100%", minHeight: 320 }} />
             {encrypting && (
               <div style={{ position: "absolute", inset: 0, background: "rgba(8,9,12,.82)", backdropFilter: "blur(3px)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12 }}>
                 <div style={{ fontSize: 13, fontFamily: MONO, color: "#fbbf24", display: "flex", alignItems: "center", gap: 9 }}>
@@ -430,15 +572,15 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
             )}
           </div>
 
-          {/* mempool strip */}
+          {/* mempool strip — shows the REAL encrypted size handle stored on-chain */}
           <div style={{ display: "flex", alignItems: "center", gap: 16, fontSize: 10.5, fontFamily: MONO, color: MUTED2, flexShrink: 0, padding: "0 2px" }}>
             <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
               <span style={{ width: 5, height: 5, borderRadius: "50%", background: AMBER, opacity: .6, display: "inline-block" }} />
-              Last tx: <span style={{ color: "#7d8896" }}>0x9c2b…f44d</span>
+              encrypted size euint64:
             </span>
-            <span>dir=<span style={{ color: MUTED2 }}>{cipherA}</span></span>
-            <span>size=<span style={{ color: MUTED2 }}>{cipherB}</span></span>
-            <span style={{ marginLeft: "auto", color: GREEN, display: "flex", alignItems: "center", gap: 5 }}>● mempool sees ciphertext only</span>
+            <span>size=<span style={{ color: "#7d8896" }}>{cipherSize}</span></span>
+            <button onClick={() => setShowProof(true)} style={{ background: "#241b0c", border: "1px solid #5e4a24", color: "#fbbf24", fontFamily: MONO, fontSize: 10.5, padding: "3px 9px", borderRadius: 6, cursor: "pointer" }}>🔒 Proof of encryption</button>
+            <span style={{ marginLeft: "auto", color: GREEN, display: "flex", alignItems: "center", gap: 5 }}>● chain stores ciphertext only</span>
           </div>
         </div>
 
@@ -499,8 +641,17 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
                   <button key={v} onClick={() => setSize(v)} style={{ flex: 1, padding: "6px 0", background: INNER, border: `1px solid ${size === v ? AMBER : BORDER}`, borderRadius: 7, color: size === v ? AMBER : "#aeb8c4", fontSize: 11, fontFamily: MONO, cursor: "pointer" }}>{v}</button>
                 ))}
               </div>
+              {/* leverage — also encrypted */}
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 5 }}>
+                <span style={{ fontSize: 10, color: MUTED }}>Leverage 🔒</span>
+                <span style={{ fontSize: 13, fontWeight: 700, fontFamily: MONO, color: AMBER }}>{lev}×</span>
+              </div>
+              <input type="range" min={1} max={20} step={1} value={lev} onChange={e => setLev(Number(e.target.value))} style={{ width: "100%", marginBottom: 4, accentColor: AMBER }} />
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 8.5, color: MUTED2, fontFamily: MONO, marginBottom: 12 }}>
+                <span>1×</span><span>10×</span><span>20×</span>
+              </div>
               <div style={{ background: INNER, borderRadius: 8, padding: 10, marginBottom: 11, display: "flex", flexDirection: "column", gap: 6 }}>
-                {[["Order value", "$" + (Number(size) || 0).toLocaleString()], ["Encrypted with", "FHE / tfhe-rs"]].map(([k, v]) => (
+                {[["Order value", "$" + (Number(size) || 0).toLocaleString()], ["Notional", "$" + ((Number(size) || 0) * lev).toLocaleString()], ["Encrypted with", "FHE / tfhe-rs"]].map(([k, v]) => (
                   <div key={k} style={{ display: "flex", justifyContent: "space-between", fontSize: 11 }}>
                     <span style={{ color: MUTED }}>{k}</span>
                     <span style={{ fontFamily: MONO, color: k === "Encrypted with" ? "#fbbf24" : "#eef2f6" }}>{v}</span>
@@ -559,6 +710,34 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
   );
 }
 
+// Search a trader by username and open their profile.
+function UsernameSearch() {
+  const [q, setQ] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const publicClient = usePublicClient();
+  const openProfile = useOpenProfile();
+
+  async function go() {
+    const name = q.trim();
+    if (name.length < 3 || !publicClient) return;
+    setBusy(true); setErr("");
+    try {
+      const addr = await publicClient.readContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "resolveUsername", args: [name] }) as `0x${string}`;
+      if (!addr || addr === "0x0000000000000000000000000000000000000000") setErr("not found");
+      else { openProfile(addr); setQ(""); }
+    } catch { setErr("error"); }
+    setBusy(false);
+  }
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+      <input value={q} onChange={e => { setQ(e.target.value.replace(/[^A-Za-z0-9_]/g, "")); setErr(""); }} onKeyDown={e => e.key === "Enter" && go()} placeholder="open @username" style={{ width: 150, padding: "7px 11px", background: INNER, border: `1px solid ${err ? "#4a1515" : BORDER}`, borderRadius: 8, color: "#eef2f6", fontSize: 12, fontFamily: MONO }} />
+      <button onClick={go} disabled={busy || q.trim().length < 3} style={{ padding: "7px 12px", background: INNER, border: `1px solid ${BORDER}`, color: "#aeb8c4", fontSize: 12, borderRadius: 8, cursor: "pointer", fontFamily: MONO }}>{busy ? "…" : err || "↗"}</button>
+    </div>
+  );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // DISCOVER TAB
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -571,8 +750,22 @@ function DiscoverTab({ address }: { address: string }) {
   const [allocation, setAllocation] = useState(1000);
   const [loading, setLoading] = useState(false);
 
-  const { data: traderAddrs } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getTraders", query: {} }) as { data: readonly `0x${string}`[] | undefined };
+  const { data: traderAddrs } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getTraders", query: { staleTime: 30_000 } }) as { data: readonly `0x${string}`[] | undefined };
   const { writeContractAsync } = useWriteContract();
+  const publicClient = usePublicClient();
+  const [followErr, setFollowErr] = useState("");
+
+  const liveTraders2 = traderAddrs ?? [];
+  const usingMock2 = liveTraders2.length === 0;
+  // Batch: 3 slots per trader [traderStats, getFollowerCount, usernames]
+  const { data: discoverBatch } = useReadContracts({
+    contracts: liveTraders2.flatMap(a => ([
+      { address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "traderStats", args: [a] } as const,
+      { address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getFollowerCount", args: [a] } as const,
+      { address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "usernames", args: [a] } as const,
+    ])),
+    query: { enabled: !usingMock2, staleTime: 30_000 },
+  });
 
   function toggleFollow(addr: string) {
     setFollowing(prev => {
@@ -585,15 +778,18 @@ function DiscoverTab({ address }: { address: string }) {
 
   async function confirmFollow() {
     if (!followModal) return;
-    setLoading(true);
+    setLoading(true); setFollowErr("");
     try {
-      await writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "followTrader", args: [followModal as `0x${string}`, BigInt(allocation)] });
+      const hash = await writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "followTrader", args: [followModal as `0x${string}`, BigInt(allocation)] });
+      await publicClient?.waitForTransactionReceipt({ hash });
       toggleFollow(followModal); setFollowModal(null);
-    } catch { /* show error inline */ }
+    } catch (e) { setFollowErr(e instanceof Error && e.message.includes("no open position") ? "trader has no open position to copy" : "follow failed"); }
     setLoading(false);
   }
 
-  const traders = traderAddrs ?? [];
+  const liveTraders = liveTraders2;
+  const usingMock = usingMock2;
+  const traders = usingMock ? MOCK_TRADERS.map(t => t.addr as `0x${string}`) : liveTraders;
 
   return (
     <div style={{ padding: "18px 22px", maxWidth: 1240, margin: "0 auto", width: "100%", overflowY: "auto" }}>
@@ -602,29 +798,33 @@ function DiscoverTab({ address }: { address: string }) {
           <div style={{ fontSize: 22, fontWeight: 700, marginBottom: 4 }}>Discover traders</div>
           <div style={{ fontSize: 13, color: MUTED }}>Follow proven returns. Direction &amp; size stay encrypted — you copy the record, not the trade.</div>
         </div>
-        <div style={{ fontSize: 11, color: "#fbbf24", background: "#241b0c", border: "1px solid #5e4a24", padding: "8px 14px", borderRadius: 9, fontFamily: MONO }}>Following {following.size} traders</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <UsernameSearch />
+          {usingMock && <div style={{ fontSize: 10, color: MUTED2, background: INNER, border: `1px solid ${BORDER}`, padding: "6px 10px", borderRadius: 7, fontFamily: MONO }}>demo data</div>}
+          <div style={{ fontSize: 11, color: "#fbbf24", background: "#241b0c", border: "1px solid #5e4a24", padding: "8px 14px", borderRadius: 9, fontFamily: MONO }}>Following {following.size} traders</div>
+        </div>
       </div>
 
-      {traders.length === 0 ? (
-        <div style={{ textAlign: "center", padding: "80px 24px", color: MUTED }}>
-          <div style={{ fontSize: 32, marginBottom: 12 }}>🔍</div>
-          <div style={{ fontSize: 16, fontWeight: 600, color: "#eef2f6", marginBottom: 8 }}>No traders registered yet</div>
-          <div style={{ fontSize: 13 }}>Open an encrypted position in the Chart tab to appear here.</div>
-        </div>
-      ) : (
-        <>
-          {/* featured */}
-          <DiscoverFeatured addr={traders[0]} isFollowing={following.has(traders[0])} isSelf={traders[0].toLowerCase() === address.toLowerCase()} onFollow={() => setFollowModal(traders[0])} onUnfollow={() => toggleFollow(traders[0])} />
-          {/* grid */}
-          {traders.length > 1 && (
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12 }}>
-              {traders.slice(1).map(addr => (
-                <DiscoverCard key={addr} addr={addr} isFollowing={following.has(addr)} isSelf={addr.toLowerCase() === address.toLowerCase()} onFollow={() => setFollowModal(addr)} onUnfollow={() => toggleFollow(addr)} />
-              ))}
-            </div>
-          )}
-        </>
-      )}
+      <>
+        {/* featured */}
+        <DiscoverFeatured addr={traders[0]} isFollowing={following.has(traders[0])} isSelf={traders[0].toLowerCase() === address.toLowerCase()} onFollow={() => setFollowModal(traders[0])} onUnfollow={() => toggleFollow(traders[0])} mockData={usingMock ? MOCK_TRADERS[0] : undefined}
+          prefetchedStats={discoverBatch?.[0]?.result as [bigint,bigint,bigint] | undefined}
+          prefetchedFCount={discoverBatch?.[1]?.result as bigint | undefined}
+          prefetchedUsername={discoverBatch?.[2]?.result as string | undefined}
+        />
+        {/* grid */}
+        {traders.length > 1 && (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12 }}>
+            {traders.slice(1).map((addr, i) => (
+              <DiscoverCard key={addr} addr={addr} isFollowing={following.has(addr)} isSelf={addr.toLowerCase() === address.toLowerCase()} onFollow={() => setFollowModal(addr)} onUnfollow={() => toggleFollow(addr)} mockData={usingMock ? MOCK_TRADERS[i + 1] : undefined}
+                prefetchedStats={discoverBatch?.[(i + 1) * 3]?.result as [bigint,bigint,bigint] | undefined}
+                prefetchedFCount={discoverBatch?.[(i + 1) * 3 + 1]?.result as bigint | undefined}
+                prefetchedUsername={discoverBatch?.[(i + 1) * 3 + 2]?.result as string | undefined}
+              />
+            ))}
+          </div>
+        )}
+      </>
 
       {/* follow modal */}
       {followModal && (
@@ -640,6 +840,7 @@ function DiscoverTab({ address }: { address: string }) {
               <div style={{ fontSize: 24, fontWeight: 700, fontFamily: MONO }}>{allocation} <span style={{ fontSize: 12, color: MUTED }}>cUSDT</span></div>
             </div>
             <input type="range" min={100} max={10000} step={100} value={allocation} onChange={e => setAllocation(Number(e.target.value))} style={{ width: "100%", marginBottom: 20 }} />
+            {followErr && <div style={{ fontSize: 11, color: RED_SOFT, fontFamily: MONO, marginBottom: 12, textAlign: "center" }}>{followErr}</div>}
             <div style={{ display: "flex", gap: 10 }}>
               <button onClick={() => setFollowModal(null)} style={{ flex: 1, padding: 12, background: "#131a22", border: `1px solid ${BORDER}`, color: "#aeb8c4", fontSize: 13, fontWeight: 600, borderRadius: 11, cursor: "pointer" }}>Cancel</button>
               <button onClick={confirmFollow} disabled={loading} style={{ flex: 2, padding: 12, background: AMBER, border: "none", color: "#0c0a06", fontSize: 13, fontWeight: 700, borderRadius: 11, cursor: "pointer" }}>{loading ? "Confirming…" : "Confirm follow"}</button>
@@ -664,21 +865,23 @@ function Sparkline({ bars }: { bars: number[] }) {
   );
 }
 
-function DiscoverFeatured({ addr, isFollowing, isSelf, onFollow, onUnfollow }: { addr: string; isFollowing: boolean; isSelf: boolean; onFollow: () => void; onUnfollow: () => void }) {
-  const { data: stats } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "traderStats", args: [addr as `0x${string}`], query: {} }) as { data: [bigint, bigint, bigint] | undefined };
-  const { data: fCount } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getFollowerCount", args: [addr as `0x${string}`], query: {} }) as { data: bigint | undefined };
-  const [total, wins, pnlBps] = stats ?? [0n, 0n, 0n];
+type MockTrader = typeof MOCK_TRADERS[0];
+function DiscoverFeatured({ addr, isFollowing, isSelf, onFollow, onUnfollow, mockData, prefetchedStats, prefetchedFCount, prefetchedUsername }: { addr: string; isFollowing: boolean; isSelf: boolean; onFollow: () => void; onUnfollow: () => void; mockData?: MockTrader; prefetchedStats?: [bigint,bigint,bigint]; prefetchedFCount?: bigint; prefetchedUsername?: string }) {
+  const [total, , pnlBps] = mockData ? [mockData.total, mockData.wins, mockData.pnlBps] : (prefetchedStats ?? [0n, 0n, 0n]);
+  const fCount = mockData ? mockData.followers : (prefetchedFCount ?? 0n);
   const pct = (Number(pnlBps) / 100).toFixed(1);
   const isPos = Number(pnlBps) >= 0;
   const bars = [30, 45, 38, 55, 62, 58, 72, 80, 88];
+  const displayName = mockData?.name ?? resolvedName(prefetchedUsername, addr);
+  const openProfile = useOpenProfile();
 
   return (
     <div style={{ background: CARD, border: "1px solid #6b5320", borderRadius: 16, padding: 22, marginBottom: 14, display: "grid", gridTemplateColumns: "1fr 240px", gap: 22, alignItems: "center" }}>
       <div>
         <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 14 }}>
-          <div style={{ width: 46, height: 46, borderRadius: 12, background: "linear-gradient(135deg,#f59e0b,#fbbf24)", display: "flex", alignItems: "center", justifyContent: "center", color: "#0c0a06", fontWeight: 700, fontSize: 20 }}>{initial(addr)}</div>
+          <div onClick={() => openProfile(addr)} style={{ width: 46, height: 46, borderRadius: 12, background: "linear-gradient(135deg,#f59e0b,#fbbf24)", display: "flex", alignItems: "center", justifyContent: "center", color: "#0c0a06", fontWeight: 700, fontSize: 20, cursor: "pointer" }}>{displayName[0]?.toUpperCase()}</div>
           <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 17, fontWeight: 600 }}>{fmt(addr)}</div>
+            <div onClick={() => openProfile(addr)} style={{ fontSize: 17, fontWeight: 600, cursor: "pointer" }}>{displayName}</div>
             <div style={{ fontSize: 11, color: MUTED, fontFamily: MONO, marginTop: 2 }}>{fmt(addr)} · {total.toString()} settled</div>
           </div>
           <div style={{ fontSize: 10, color: "#fbbf24", background: "#241b0c", border: "1px solid #5e4a24", padding: "4px 10px", borderRadius: 20, fontFamily: MONO }}>★ TOP RANKED</div>
@@ -713,20 +916,21 @@ function DiscoverFeatured({ addr, isFollowing, isSelf, onFollow, onUnfollow }: {
   );
 }
 
-function DiscoverCard({ addr, isFollowing, isSelf, onFollow, onUnfollow }: { addr: string; isFollowing: boolean; isSelf: boolean; onFollow: () => void; onUnfollow: () => void }) {
-  const { data: stats } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "traderStats", args: [addr as `0x${string}`], query: {} }) as { data: [bigint, bigint, bigint] | undefined };
-  const { data: fCount } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getFollowerCount", args: [addr as `0x${string}`], query: {} }) as { data: bigint | undefined };
-  const [total, , pnlBps] = stats ?? [0n, 0n, 0n];
+function DiscoverCard({ addr, isFollowing, isSelf, onFollow, onUnfollow, mockData, prefetchedStats, prefetchedFCount, prefetchedUsername }: { addr: string; isFollowing: boolean; isSelf: boolean; onFollow: () => void; onUnfollow: () => void; mockData?: MockTrader; prefetchedStats?: [bigint,bigint,bigint]; prefetchedFCount?: bigint; prefetchedUsername?: string }) {
+  const [total, , pnlBps] = mockData ? [mockData.total, mockData.wins, mockData.pnlBps] : (prefetchedStats ?? [0n, 0n, 0n]);
+  const fCount = mockData ? mockData.followers : (prefetchedFCount ?? 0n);
   const pct = (Number(pnlBps) / 100).toFixed(1);
   const isPos = Number(pnlBps) >= 0;
   const bars = [42, 50, 44, 56, 60, 52, 68, 62, 70];
+  const displayName = mockData?.name ?? resolvedName(prefetchedUsername, addr);
+  const openProfile = useOpenProfile();
 
   return (
     <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 14, padding: 17 }}>
       <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 13 }}>
-        <div style={{ width: 38, height: 38, borderRadius: 10, background: "#161d25", display: "flex", alignItems: "center", justifyContent: "center", color: "#aeb8c4", fontWeight: 700, fontSize: 15, flexShrink: 0 }}>{initial(addr)}</div>
+        <div onClick={() => openProfile(addr)} style={{ width: 38, height: 38, borderRadius: 10, background: "#161d25", display: "flex", alignItems: "center", justifyContent: "center", color: "#aeb8c4", fontWeight: 700, fontSize: 15, flexShrink: 0, cursor: "pointer" }}>{displayName[0]?.toUpperCase()}</div>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{fmt(addr)}</div>
+          <div onClick={() => openProfile(addr)} style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", cursor: "pointer" }}>{displayName}</div>
           <div style={{ fontSize: 10, color: MUTED, fontFamily: MONO, marginTop: 1 }}>🔒 sealed · {total.toString()} settled</div>
         </div>
         <div style={{ textAlign: "right", flexShrink: 0 }}>
@@ -755,8 +959,18 @@ function FollowingTab({ address }: { address: string }) {
     if (typeof window === "undefined") return [];
     try { return JSON.parse(localStorage.getItem("ct_following") || "[]"); } catch { return []; }
   });
-  const { data: traderAddrs } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getTraders", query: {} }) as { data: readonly `0x${string}`[] | undefined };
+  const { data: traderAddrs } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getTraders", query: { staleTime: 30_000 } }) as { data: readonly `0x${string}`[] | undefined };
   const followed = (traderAddrs ?? []).filter(a => following.includes(a.toLowerCase()) || following.includes(a));
+
+  // Batch: 3 slots per followed trader [traderStats, isPositionOpen, usernames]
+  const { data: followBatch } = useReadContracts({
+    contracts: followed.flatMap(a => ([
+      { address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "traderStats", args: [a] } as const,
+      { address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "isPositionOpen", args: [a] } as const,
+      { address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "usernames", args: [a] } as const,
+    ])),
+    query: { enabled: followed.length > 0, staleTime: 30_000 },
+  });
 
   return (
     <div style={{ padding: "18px 22px", maxWidth: 1240, margin: "0 auto", width: "100%", overflowY: "auto" }}>
@@ -784,7 +998,11 @@ function FollowingTab({ address }: { address: string }) {
         </div>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 24 }}>
-          {followed.map(addr => <FollowingRow key={addr} addr={addr} />)}
+          {followed.map((addr, i) => <FollowingRow key={addr} addr={addr}
+            prefetchedStats={followBatch?.[i * 3]?.result as [bigint,bigint,bigint] | undefined}
+            prefetchedPosOpen={followBatch?.[i * 3 + 1]?.result as boolean | undefined}
+            prefetchedUsername={followBatch?.[i * 3 + 2]?.result as string | undefined}
+          />)}
         </div>
       )}
 
@@ -793,11 +1011,11 @@ function FollowingTab({ address }: { address: string }) {
           <div style={{ fontSize: 14, fontWeight: 600, color: "#aeb8c4", marginBottom: 12 }}>Settled positions</div>
           <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 14, overflow: "hidden" }}>
             <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr 1fr 1fr", background: INNER, padding: "10px 16px" }}>
-              {["TRADER", "ALLOC", "DIRECTION", "P&L", "DATE"].map(h => (
+              {["TRADER", "SIZE / LEV", "DIRECTION", "P&L", "DATE"].map(h => (
                 <div key={h} style={{ fontSize: 10, fontWeight: 600, color: MUTED2, fontFamily: MONO }}>{h}</div>
               ))}
             </div>
-            <div style={{ padding: "14px 16px", color: MUTED2, fontSize: 12, textAlign: "center" }}>No settled positions yet</div>
+            <FollowedSettled traders={followed} />
           </div>
         </>
       )}
@@ -805,17 +1023,64 @@ function FollowingTab({ address }: { address: string }) {
   );
 }
 
-function FollowingRow({ addr }: { addr: string }) {
-  const { data: stats } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "traderStats", args: [addr as `0x${string}`], query: {} }) as { data: [bigint, bigint, bigint] | undefined };
-  const { data: posOpen } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "isPositionOpen", args: [addr as `0x${string}`], query: {} }) as { data: boolean | undefined };
-  const [, , pnlBps] = stats ?? [0n, 0n, 0n];
+// Settled trades from the traders you follow (their public, revealed track record).
+function FollowedSettled({ traders }: { traders: readonly string[] }) {
+  const { data } = useReadContracts({
+    contracts: traders.flatMap(a => ([
+      { address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getTradeHistory", args: [a as `0x${string}`] } as const,
+      { address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "usernames", args: [a as `0x${string}`] } as const,
+    ])),
+    query: { enabled: traders.length > 0, staleTime: 30_000 },
+  });
+
+  type Row = { addr: string; entryPrice: bigint; exitPrice: bigint; direction: boolean; size: bigint; leverage: bigint; pnlBps: bigint; timestamp: bigint };
+  const rows: Row[] = [];
+  const usernameMap: Record<string, string> = {};
+  traders.forEach((a, i) => {
+    const hist = data?.[i * 2]?.result as readonly Omit<Row, "addr">[] | undefined;
+    const username = data?.[i * 2 + 1]?.result as string | undefined;
+    if (username) usernameMap[a] = username;
+    hist?.forEach(h => rows.push({ addr: a, ...h }));
+  });
+  rows.sort((x, y) => Number(y.timestamp) - Number(x.timestamp));
+
+  if (rows.length === 0) return <div style={{ padding: "14px 16px", color: MUTED2, fontSize: 12, textAlign: "center" }}>No settled positions from followed traders yet</div>;
+
+  return (
+    <>
+      {rows.slice(0, 20).map((r, i) => {
+        const pnl = Number(r.pnlBps) / 100;
+        return (
+          <div key={i} style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr 1fr 1fr", padding: "12px 16px", borderTop: `1px solid ${BORDER2}`, alignItems: "center", fontSize: 12, fontFamily: MONO }}>
+            <FollowedName addr={r.addr} prefetchedUsername={usernameMap[r.addr]} />
+            <div style={{ color: "#aeb8c4" }}>{r.size.toString()} <span style={{ color: AMBER }}>{r.leverage.toString()}×</span></div>
+            <div><span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 5, background: r.direction ? "rgba(34,197,94,.12)" : "rgba(239,68,68,.12)", color: r.direction ? GREEN : RED }}>{r.direction ? "LONG" : "SHORT"}</span></div>
+            <div style={{ color: pnl >= 0 ? GREEN : RED_SOFT, fontWeight: 700 }}>{pnl >= 0 ? "+" : ""}{pnl.toFixed(1)}%</div>
+            <div style={{ color: MUTED2 }}>{new Date(Number(r.timestamp) * 1000).toLocaleDateString()}</div>
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+function FollowedName({ addr, prefetchedUsername }: { addr: string; prefetchedUsername?: string }) {
+  const openProfile = useOpenProfile();
+  return <div onClick={() => openProfile(addr)} style={{ color: "#eef2f6", cursor: "pointer" }}>{resolvedName(prefetchedUsername, addr)}</div>;
+}
+
+function FollowingRow({ addr, prefetchedStats, prefetchedPosOpen, prefetchedUsername }: { addr: string; prefetchedStats?: [bigint,bigint,bigint]; prefetchedPosOpen?: boolean; prefetchedUsername?: string }) {
+  const [, , pnlBps] = prefetchedStats ?? [0n, 0n, 0n];
+  const posOpen = prefetchedPosOpen;
+  const displayName = resolvedName(prefetchedUsername, addr);
+  const openProfile = useOpenProfile();
 
   return (
     <div style={{ background: CARD, border: `1px solid ${posOpen ? "rgba(34,197,94,.2)" : BORDER}`, borderRadius: 14, padding: 16, display: "grid", gridTemplateColumns: "auto 1fr auto auto", gap: 0, alignItems: "center" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 11, marginRight: 18 }}>
-        <div style={{ width: 40, height: 40, borderRadius: 11, background: "linear-gradient(135deg,#f59e0b,#fbbf24)", display: "flex", alignItems: "center", justifyContent: "center", color: "#0c0a06", fontWeight: 700, fontSize: 16, flexShrink: 0 }}>{initial(addr)}</div>
+      <div onClick={() => openProfile(addr)} style={{ display: "flex", alignItems: "center", gap: 11, marginRight: 18, cursor: "pointer" }}>
+        <div style={{ width: 40, height: 40, borderRadius: 11, background: "linear-gradient(135deg,#f59e0b,#fbbf24)", display: "flex", alignItems: "center", justifyContent: "center", color: "#0c0a06", fontWeight: 700, fontSize: 16, flexShrink: 0 }}>{displayName[0]?.toUpperCase()}</div>
         <div>
-          <div style={{ fontSize: 14, fontWeight: 600 }}>{fmt(addr)}</div>
+          <div style={{ fontSize: 14, fontWeight: 600 }}>{displayName}</div>
           <div style={{ fontSize: 10, color: MUTED, fontFamily: MONO, marginTop: 1 }}>{addr.slice(0, 10)}…{addr.slice(-6)}</div>
         </div>
       </div>
@@ -843,29 +1108,111 @@ function FollowingRow({ addr }: { addr: string }) {
 function PortfolioTab({ address, livePrice }: { address: string; livePrice: number }) {
   const { data: positionData } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getPosition", args: [address as `0x${string}`], query: { enabled: !!address } }) as { data: [bigint, bigint, boolean, boolean] | undefined };
   const { data: isOpen, refetch: refetchOpen } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "isPositionOpen", args: [address as `0x${string}`], query: { enabled: !!address } }) as { data: boolean | undefined; refetch: () => void };
-  const { data: stakedBalance } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "stakedBalance", args: [address as `0x${string}`], query: { enabled: !!address } }) as { data: bigint | undefined };
+  const { data: stakedFlag, refetch: refetchStake } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "staked", args: [address as `0x${string}`], query: { enabled: !!address } }) as { data: boolean | undefined; refetch: () => void };
+  const { data: claimedFaucet, refetch: refetchFaucet } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "claimedFaucet", args: [address as `0x${string}`], query: { enabled: !!address } }) as { data: boolean | undefined; refetch: () => void };
+  const { data: balHandle, refetch: refetchBal } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "confidentialBalanceOf", args: [address as `0x${string}`], query: { enabled: !!address } }) as { data: `0x${string}` | undefined; refetch: () => void };
   const { data: traderStats } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "traderStats", args: [address as `0x${string}`], query: { enabled: !!address } }) as { data: [bigint, bigint, bigint] | undefined };
   const { data: followerCount } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getFollowerCount", args: [address as `0x${string}`], query: { enabled: !!address } }) as { data: bigint | undefined };
-  const { data: history } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getTradeHistory", args: [address as `0x${string}`], query: { enabled: !!address } }) as { data: readonly { entryPrice: bigint; exitPrice: bigint; direction: boolean; size: bigint; pnlBps: bigint; timestamp: bigint }[] | undefined };
+  const { data: history } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getTradeHistory", args: [address as `0x${string}`], query: { enabled: !!address } }) as { data: readonly { entryPrice: bigint; exitPrice: bigint; direction: boolean; size: bigint; leverage: bigint; pnlBps: bigint; timestamp: bigint }[] | undefined };
+  const { data: myUsername, refetch: refetchUsername } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "usernames", args: [address as `0x${string}`], query: { enabled: !!address } }) as { data: string | undefined; refetch: () => void };
 
   const [total, wins, pnlBps] = traderStats ?? [0n, 0n, 0n];
   const winRate = total > 0n ? Math.round(Number(wins) / Number(total) * 100) : 0;
-  const isStaked = !!(stakedBalance && stakedBalance > 0n);
+  const isStaked = !!stakedFlag;
   const entryPrice = positionData ? Number(positionData[1]) / 1e6 : 0;
   const unrealizedPct = isOpen && entryPrice > 0 ? ((livePrice - entryPrice) / entryPrice * 100) : 0;
   const pnlPos = unrealizedPct >= 0;
   const fCount = Number(followerCount ?? 0n);
 
   const { writeContractAsync } = useWriteContract();
+  const { data: walletClient } = useWalletClient();
+  const publicClient = usePublicClient();
   const [loading, setLoading] = useState(false);
-  async function handleClose() {
+  const [wrapAmt, setWrapAmt] = useState("100");
+  const [cBalance, setCBalance] = useState<number | null>(null);
+  const [revealing, setRevealing] = useState(false);
+  const [nameInput, setNameInput] = useState("");
+  useEffect(() => { if (myUsername) setNameInput(myUsername); }, [myUsername]);
+
+  async function tx(fn: () => Promise<`0x${string}`>, after?: () => void) {
     setLoading(true);
-    try { await writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "closePosition" }); refetchOpen(); } catch { /* ignore */ }
+    try {
+      const hash = await fn();
+      await publicClient?.waitForTransactionReceipt({ hash });
+      after?.();
+    } catch { /* ignore */ }
     setLoading(false);
+  }
+
+  const handleClose = () => tx(
+    () => writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "closePosition", args: [BigInt(Math.round(livePrice * 1e6))] }),
+    () => { refetchOpen(); refetchBal(); setCBalance(null); }
+  );
+  const handleFaucet = () => tx(
+    () => writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "faucet" }),
+    () => { refetchFaucet(); refetchBal(); setCBalance(null); }
+  );
+  const handleSetUsername = () => tx(
+    () => writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "setUsername", args: [nameInput.trim()] }),
+    () => { refetchUsername(); }
+  );
+  const handleWrap = () => tx(
+    () => writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "wrap", args: [BigInt(Math.round(Number(wrapAmt || "0") * 1e6))] }),
+    () => { refetchBal(); setCBalance(null); }
+  );
+  const handleStake = () => tx(
+    () => writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: isStaked ? "unstake" : "stake" }),
+    () => { refetchStake(); refetchBal(); setCBalance(null); }
+  );
+
+  // client-side decrypt of the user's own confidential cUSDT balance
+  async function revealBalance() {
+    if (!balHandle || !walletClient || balHandle === "0x0000000000000000000000000000000000000000000000000000000000000000") { setCBalance(0); return; }
+    setRevealing(true);
+    try {
+      const fhevm = await getFhevm();
+      const keypair = fhevm.generateKeypair();
+      const start = Math.floor(Date.now() / 1000);
+      const days = 7;
+      const eip712 = fhevm.createEIP712(keypair.publicKey, [CIPHER_TRADE_ADDRESS], start, days);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const sig = await walletClient.signTypedData({
+        account: address as `0x${string}`,
+        domain: eip712.domain,
+        types: { UserDecryptRequestVerification: eip712.types.UserDecryptRequestVerification },
+        primaryType: "UserDecryptRequestVerification",
+        message: eip712.message,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any);
+      const res = await fhevm.userDecrypt(
+        [{ handle: balHandle, contractAddress: CIPHER_TRADE_ADDRESS }],
+        keypair.privateKey, keypair.publicKey, sig.replace("0x", ""),
+        [CIPHER_TRADE_ADDRESS], address, start, days,
+      );
+      setCBalance(Number(res[balHandle]) / 1e6);
+    } catch { setCBalance(null); }
+    setRevealing(false);
   }
 
   return (
     <div style={{ padding: "18px 22px", maxWidth: 1240, margin: "0 auto", width: "100%", overflowY: "auto" }}>
+      {/* Profile / username */}
+      <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 14, padding: 16, marginBottom: 14, display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+        <div style={{ width: 46, height: 46, borderRadius: 12, background: "linear-gradient(135deg,#f59e0b,#fbbf24)", display: "flex", alignItems: "center", justifyContent: "center", color: "#0c0a06", fontWeight: 700, fontSize: 20 }}>
+          {(myUsername?.[0] ?? address.slice(2, 3)).toUpperCase()}
+        </div>
+        <div style={{ flex: 1, minWidth: 200 }}>
+          <div style={{ fontSize: 11, color: MUTED2, marginBottom: 4 }}>Public username — others can open your profile by this</div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <input value={nameInput} onChange={e => setNameInput(e.target.value.replace(/[^A-Za-z0-9_]/g, "").slice(0, 20))} placeholder="set a username (3–20 chars)" style={{ flex: 1, maxWidth: 320, padding: "9px 12px", background: INNER, border: `1px solid ${BORDER}`, borderRadius: 9, color: "#eef2f6", fontSize: 14, fontFamily: MONO }} />
+            <button onClick={handleSetUsername} disabled={loading || nameInput.trim().length < 3 || nameInput.trim() === myUsername} style={{ padding: "9px 18px", border: "1px solid #6b5320", background: "transparent", color: "#fbbf24", fontSize: 13, fontWeight: 600, borderRadius: 9, cursor: loading ? "not-allowed" : "pointer", fontFamily: SANS, opacity: nameInput.trim().length < 3 || nameInput.trim() === myUsername ? 0.5 : 1 }}>
+              {loading ? "…" : myUsername ? "Update" : "Claim"}
+            </button>
+          </div>
+        </div>
+        <div style={{ fontFamily: MONO, fontSize: 11, color: MUTED2 }}>{address.slice(0, 6)}…{address.slice(-4)}</div>
+      </div>
+
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 10, marginBottom: 20 }}>
         {[
           { label: "Total copied", value: "$" + (fCount * 500).toLocaleString(), color: "#eef2f6" },
@@ -878,6 +1225,37 @@ function PortfolioTab({ address, livePrice }: { address: string; livePrice: numb
             <div style={{ fontSize: 26, fontWeight: 700, fontFamily: MONO, color: s.color }}>{s.value}</div>
           </div>
         ))}
+      </div>
+
+      {/* Confidential cUSDT wallet */}
+      <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 14, padding: 18, marginBottom: 16, display: "flex", alignItems: "center", gap: 20, flexWrap: "wrap" }}>
+        <div style={{ minWidth: 200 }}>
+          <div style={{ fontSize: 11, color: MUTED2, marginBottom: 4, display: "flex", alignItems: "center", gap: 6 }}>🔒 Confidential cUSDT balance</div>
+          <div style={{ fontSize: 28, fontWeight: 700, fontFamily: MONO, color: AMBER }}>
+            {cBalance === null ? "•••••• cUSDT" : cBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " cUSDT"}
+          </div>
+          <button onClick={revealBalance} disabled={revealing} style={{ marginTop: 6, padding: "4px 10px", fontSize: 11, fontFamily: MONO, border: `1px solid ${BORDER}`, background: INNER, color: "#aeb8c4", borderRadius: 7, cursor: "pointer" }}>
+            {revealing ? "Decrypting…" : cBalance === null ? "🔓 Reveal (decrypt)" : "↻ Refresh"}
+          </button>
+        </div>
+        <div style={{ width: 1, height: 56, background: BORDER }} />
+        <div style={{ flex: 1, minWidth: 220 }}>
+          {!claimedFaucet ? (
+            <button onClick={handleFaucet} disabled={loading} style={{ width: "100%", padding: 11, border: "1px solid #6b5320", background: "linear-gradient(135deg,#f59e0b,#fbbf24)", color: "#0c0a06", fontSize: 13, fontWeight: 700, borderRadius: 10, cursor: loading ? "not-allowed" : "pointer", fontFamily: SANS }}>
+              {loading ? "…" : "🎁 Claim 300 cUSDT sign-up grant"}
+            </button>
+          ) : (
+            <div>
+              <div style={{ fontSize: 11, color: MUTED2, marginBottom: 6 }}>Convert Sepolia USDT → cUSDT</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input value={wrapAmt} onChange={e => setWrapAmt(e.target.value.replace(/[^0-9.]/g, ""))} style={{ flex: 1, padding: "9px 12px", background: INNER, border: `1px solid ${BORDER}`, borderRadius: 9, color: "#eef2f6", fontSize: 14, fontFamily: MONO }} />
+                <button onClick={handleWrap} disabled={loading} style={{ padding: "9px 18px", border: "1px solid #6b5320", background: "transparent", color: "#fbbf24", fontSize: 13, fontWeight: 600, borderRadius: 9, cursor: loading ? "not-allowed" : "pointer", fontFamily: SANS, whiteSpace: "nowrap" }}>
+                  {loading ? "…" : "Wrap →"}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 340px", gap: 16, marginBottom: 22 }}>
@@ -926,8 +1304,8 @@ function PortfolioTab({ address, livePrice }: { address: string; livePrice: numb
             ))}
           </div>
           <div style={{ fontSize: 11, color: MUTED2, lineHeight: 1.45 }}>{isStaked ? "Staked · 18% performance fee · loss-sharing enabled" : "Stake 100 cUSDT to unlock 18% fee tier"}</div>
-          <button style={{ padding: 10, border: "1px solid #6b5320", background: "transparent", color: "#fbbf24", fontSize: 13, fontWeight: 600, borderRadius: 10, cursor: "pointer", fontFamily: SANS }}>
-            {isStaked ? "Unstake 100 cUSDT" : "Stake 100 cUSDT"}
+          <button onClick={handleStake} disabled={loading || isOpen} style={{ padding: 10, border: "1px solid #6b5320", background: "transparent", color: "#fbbf24", fontSize: 13, fontWeight: 600, borderRadius: 10, cursor: loading || isOpen ? "not-allowed" : "pointer", opacity: loading || isOpen ? 0.5 : 1, fontFamily: SANS }}>
+            {loading ? "…" : isStaked ? "Unstake 100 cUSDT" : "Stake 100 cUSDT"}
           </button>
         </div>
       </div>
@@ -950,7 +1328,7 @@ function PortfolioTab({ address, livePrice }: { address: string; livePrice: numb
               <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr 1fr 1fr 1fr", padding: "12px 16px", borderTop: `1px solid ${BORDER2}`, alignItems: "center" }}>
                 <div style={{ fontSize: 11, color: MUTED2, fontFamily: MONO }}>{new Date(Number(tr.timestamp) * 1000).toLocaleDateString()}</div>
                 <div><span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 5, background: tr.direction ? "rgba(34,197,94,.12)" : "rgba(239,68,68,.12)", color: tr.direction ? GREEN : RED }}>▲ {tr.direction ? "LONG" : "SHORT"}</span></div>
-                <div style={{ fontSize: 12, fontFamily: MONO }}>{tr.size.toString()}</div>
+                <div style={{ fontSize: 12, fontFamily: MONO }}>{tr.size.toString()} <span style={{ color: AMBER }}>{tr.leverage.toString()}×</span></div>
                 <div style={{ fontSize: 12, fontFamily: MONO, color: "#aeb8c4" }}>${(Number(tr.entryPrice) / 1e6).toFixed(2)}</div>
                 <div style={{ fontSize: 12, fontFamily: MONO, color: "#aeb8c4" }}>${(Number(tr.exitPrice) / 1e6).toFixed(2)}</div>
                 <div style={{ fontSize: 12, fontFamily: MONO, color: isWin ? GREEN : RED_SOFT, fontWeight: 600 }}>{isWin ? "+" : ""}{pnl.toFixed(1)}%</div>
@@ -970,7 +1348,42 @@ function PortfolioTab({ address, livePrice }: { address: string; livePrice: numb
 function LeaderboardTab() {
   const [period, setPeriod] = useState<"all" | "30d" | "7d">("all");
   const { data: traderAddrs } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getTraders", query: {} }) as { data: readonly `0x${string}`[] | undefined };
-  const traders = traderAddrs ?? [];
+  const liveTraders = traderAddrs ?? [];
+  const usingMock = liveTraders.length === 0;
+
+  // One batch for ALL per-trader data — avoids N×4 individual hook calls in child rows.
+  // 5 slots per trader: [stats, history, isPositionOpen, followerCount, username]
+  const { data: batch } = useReadContracts({
+    contracts: liveTraders.flatMap(a => ([
+      { address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "traderStats", args: [a] } as const,
+      { address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getTradeHistory", args: [a] } as const,
+      { address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "isPositionOpen", args: [a] } as const,
+      { address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getFollowerCount", args: [a] } as const,
+      { address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "usernames", args: [a] } as const,
+    ])),
+    query: { enabled: !usingMock, staleTime: 30_000 },
+  });
+
+  const now = Date.now() / 1000;
+  const cutoff = period === "7d" ? now - 7 * 86400 : period === "30d" ? now - 30 * 86400 : 0;
+
+  // ranked list (best net P&L first). For a period, sum only that window's trades.
+  const ranked: { addr: `0x${string}`; netPnlBps: number; stats?: [bigint,bigint,bigint]; posOpen?: boolean; fCount?: bigint; username?: string; mock?: MockTrader }[] = usingMock
+    ? [...MOCK_TRADERS].sort((a, b) => Number(b.pnlBps) - Number(a.pnlBps)).map(m => ({ addr: m.addr as `0x${string}`, netPnlBps: Number(m.pnlBps), mock: m }))
+    : liveTraders.map((a, i) => {
+        const stats = batch?.[i * 5]?.result as [bigint, bigint, bigint] | undefined;
+        const hist = batch?.[i * 5 + 1]?.result as readonly { pnlBps: bigint; timestamp: bigint }[] | undefined;
+        const posOpen = batch?.[i * 5 + 2]?.result as boolean | undefined;
+        const fCount = batch?.[i * 5 + 3]?.result as bigint | undefined;
+        const username = batch?.[i * 5 + 4]?.result as string | undefined;
+        const net = period === "all" || !hist
+          ? Number(stats?.[2] ?? 0n)
+          : hist.filter(h => Number(h.timestamp) >= cutoff).reduce((s, h) => s + Number(h.pnlBps), 0);
+        return { addr: a, netPnlBps: net, stats, posOpen, fCount, username };
+      }).sort((a, b) => b.netPnlBps - a.netPnlBps);
+
+  const traders = ranked.map(r => r.addr);
+  const mockFor = (i: number) => ranked[i]?.mock;
 
   return (
     <div style={{ padding: "18px 22px", maxWidth: 1240, margin: "0 auto", width: "100%", overflowY: "auto" }}>
@@ -979,16 +1392,19 @@ function LeaderboardTab() {
           <div style={{ fontSize: 24, fontWeight: 700, marginBottom: 5 }}>Leaderboard</div>
           <div style={{ fontSize: 13, color: MUTED }}>Ranked by verified on-chain track record. All positions were sealed during trading.</div>
         </div>
-        <div style={{ display: "flex", background: "#131a22", border: `1px solid ${BORDER}`, borderRadius: 9, padding: 3, gap: 2 }}>
-          {(["all", "30d", "7d"] as const).map(p => (
-            <button key={p} onClick={() => setPeriod(p)} style={{ padding: "6px 14px", borderRadius: 7, fontSize: 12, fontWeight: 600, border: "none", cursor: "pointer", fontFamily: SANS, background: period === p ? "#1e2a36" : "transparent", color: period === p ? "#eef2f6" : MUTED }}>
-              {p === "all" ? "All time" : p === "30d" ? "30D" : "7D"}
-            </button>
-          ))}
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          {usingMock && <div style={{ fontSize: 10, color: MUTED2, background: INNER, border: `1px solid ${BORDER}`, padding: "6px 10px", borderRadius: 7, fontFamily: MONO }}>demo data</div>}
+          <div style={{ display: "flex", background: "#131a22", border: `1px solid ${BORDER}`, borderRadius: 9, padding: 3, gap: 2 }}>
+            {(["all", "30d", "7d"] as const).map(p => (
+              <button key={p} onClick={() => setPeriod(p)} style={{ padding: "6px 14px", borderRadius: 7, fontSize: 12, fontWeight: 600, border: "none", cursor: "pointer", fontFamily: SANS, background: period === p ? "#1e2a36" : "transparent", color: period === p ? "#eef2f6" : MUTED }}>
+                {p === "all" ? "All time" : p === "30d" ? "30D" : "7D"}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
-      {traders.length === 0 ? (
+      {false ? (
         <div style={{ textAlign: "center", padding: "80px 24px", color: MUTED }}>
           <div style={{ fontSize: 32, marginBottom: 12 }}>🏆</div>
           <div style={{ fontSize: 15, fontWeight: 600, color: "#eef2f6", marginBottom: 8 }}>No traders yet</div>
@@ -999,7 +1415,7 @@ function LeaderboardTab() {
           {/* podium */}
           {traders.length >= 3 && (
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1.14fr 1fr", gap: 12, marginBottom: 22 }}>
-              {[traders[1], traders[0], traders[2]].map((addr, i) => {
+              {[ranked[1], ranked[0], ranked[2]].map((r, i) => {
                 const rank = [2, 1, 3][i];
                 const colors: Record<number, { bg: string; border: string; rankColor: string; glow: string }> = {
                   1: { bg: "rgba(245,158,11,.06)", border: "#6b5320", rankColor: "#fbbf24", glow: "rgba(245,158,11,.15)" },
@@ -1007,7 +1423,12 @@ function LeaderboardTab() {
                   3: { bg: "rgba(180,83,9,.04)", border: "#4b2e0a", rankColor: "#b45309", glow: "rgba(180,83,9,.1)" },
                 };
                 const c = colors[rank];
-                return <PodiumCard key={addr} addr={addr} rank={rank} colors={c} />;
+                if (!r) return null;
+                return <PodiumCard key={r.addr} addr={r.addr} rank={rank} colors={c}
+                  mockData={r.mock}
+                  prefetchedStats={r.stats}
+                  prefetchedUsername={r.username}
+                />;
               })}
             </div>
           )}
@@ -1018,7 +1439,12 @@ function LeaderboardTab() {
                 <div key={h} style={{ fontSize: 10, fontWeight: 600, color: MUTED2, fontFamily: MONO }}>{h}</div>
               ))}
             </div>
-            {traders.map((addr, i) => <LeaderRow key={addr} addr={addr} rank={i + 1} />)}
+            {ranked.map((r, i) => <LeaderRow key={r.addr} addr={r.addr} rank={i + 1} mockData={r.mock}
+              prefetchedStats={r.stats}
+              prefetchedPosOpen={r.posOpen}
+              prefetchedFCount={r.fCount}
+              prefetchedUsername={r.username}
+            />)}
           </div>
         </>
       )}
@@ -1026,18 +1452,19 @@ function LeaderboardTab() {
   );
 }
 
-function PodiumCard({ addr, rank, colors }: { addr: string; rank: number; colors: { bg: string; border: string; rankColor: string; glow: string } }) {
-  const { data: stats } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "traderStats", args: [addr as `0x${string}`], query: {} }) as { data: [bigint, bigint, bigint] | undefined };
-  const [total, , pnlBps] = stats ?? [0n, 0n, 0n];
+function PodiumCard({ addr, rank, colors, mockData, prefetchedStats, prefetchedUsername }: { addr: string; rank: number; colors: { bg: string; border: string; rankColor: string; glow: string }; mockData?: MockTrader; prefetchedStats?: [bigint,bigint,bigint]; prefetchedUsername?: string }) {
+  const [total, , pnlBps] = mockData ? [mockData.total, 0n, mockData.pnlBps] : (prefetchedStats ?? [0n, 0n, 0n]);
   const pct = (Number(pnlBps) / 100).toFixed(1);
   const isPos = Number(pnlBps) >= 0;
+  const displayName = mockData?.name ?? resolvedName(prefetchedUsername, addr);
+  const openProfile = useOpenProfile();
 
   return (
-    <div style={{ background: colors.bg, border: `1px solid ${colors.border}`, borderRadius: 16, padding: 20, textAlign: "center", position: "relative", overflow: "hidden" }}>
+    <div onClick={() => openProfile(addr)} style={{ background: colors.bg, border: `1px solid ${colors.border}`, borderRadius: 16, padding: 20, textAlign: "center", position: "relative", overflow: "hidden", cursor: "pointer" }}>
       <div style={{ position: "absolute", top: -40, left: "50%", transform: "translateX(-50%)", width: 160, height: 100, background: colors.glow, filter: "blur(18px)" }} />
       <div style={{ fontSize: 26, fontWeight: 700, fontFamily: MONO, color: colors.rankColor, marginBottom: 8, position: "relative" }}>#{rank}</div>
-      <div style={{ width: 50, height: 50, borderRadius: 13, background: "linear-gradient(135deg,#f59e0b,#fbbf24)", display: "flex", alignItems: "center", justifyContent: "center", color: "#0c0a06", fontWeight: 700, fontSize: 20, margin: "0 auto 10px", position: "relative" }}>{initial(addr)}</div>
-      <div style={{ fontSize: 14, fontWeight: 600, position: "relative" }}>{fmt(addr)}</div>
+      <div style={{ width: 50, height: 50, borderRadius: 13, background: "linear-gradient(135deg,#f59e0b,#fbbf24)", display: "flex", alignItems: "center", justifyContent: "center", color: "#0c0a06", fontWeight: 700, fontSize: 20, margin: "0 auto 10px", position: "relative" }}>{displayName[0]}</div>
+      <div style={{ fontSize: 14, fontWeight: 600, position: "relative" }}>{displayName}</div>
       <div style={{ fontSize: 10, color: MUTED, fontFamily: MONO, marginTop: 2, marginBottom: 12, position: "relative" }}>{total.toString()} settled</div>
       <div style={{ fontSize: 32, fontWeight: 700, fontFamily: MONO, color: isPos ? GREEN : RED_SOFT, lineHeight: 1, position: "relative" }}>{isPos ? "+" : ""}{pct}%</div>
       <div style={{ fontSize: 10, color: MUTED, marginTop: 3, marginBottom: 14, position: "relative" }}>net return</div>
@@ -1045,12 +1472,12 @@ function PodiumCard({ addr, rank, colors }: { addr: string; rank: number; colors
   );
 }
 
-function LeaderRow({ addr, rank }: { addr: string; rank: number }) {
-  const { data: stats } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "traderStats", args: [addr as `0x${string}`], query: {} }) as { data: [bigint, bigint, bigint] | undefined };
-  const { data: posOpen } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "isPositionOpen", args: [addr as `0x${string}`], query: {} }) as { data: boolean | undefined };
-  const { data: fCount } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getFollowerCount", args: [addr as `0x${string}`], query: {} }) as { data: bigint | undefined };
-
-  const [total, wins, pnlBps] = stats ?? [0n, 0n, 0n];
+function LeaderRow({ addr, rank, mockData, prefetchedStats, prefetchedPosOpen, prefetchedFCount, prefetchedUsername }: { addr: string; rank: number; mockData?: MockTrader; prefetchedStats?: [bigint,bigint,bigint]; prefetchedPosOpen?: boolean; prefetchedFCount?: bigint; prefetchedUsername?: string }) {
+  const [total, wins, pnlBps] = mockData ? [mockData.total, mockData.wins, mockData.pnlBps] : (prefetchedStats ?? [0n, 0n, 0n]);
+  const posOpen = mockData ? mockData.posOpen : prefetchedPosOpen;
+  const fCount = mockData ? mockData.followers : prefetchedFCount;
+  const displayName = mockData?.name ?? resolvedName(prefetchedUsername, addr);
+  const openProfile = useOpenProfile();
   const winRate = total > 0n ? Math.round(Number(wins) / Number(total) * 100) : 0;
   const pnl = Number(pnlBps) / 100;
   const isPos = pnl >= 0;
@@ -1059,12 +1486,12 @@ function LeaderRow({ addr, rank }: { addr: string; rank: number }) {
   const accent = accentColors[rank] ?? "transparent";
 
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "52px 1.8fr 1fr 1fr 1fr 1fr 1fr 120px", padding: "13px 16px", borderTop: `1px solid ${BORDER2}`, alignItems: "center", borderLeft: `3px solid ${accent}` }}>
+    <div onClick={() => openProfile(addr)} style={{ display: "grid", gridTemplateColumns: "52px 1.8fr 1fr 1fr 1fr 1fr 1fr 120px", padding: "13px 16px", borderTop: `1px solid ${BORDER2}`, alignItems: "center", borderLeft: `3px solid ${accent}`, cursor: "pointer" }}>
       <div style={{ fontSize: 14, fontWeight: 700, fontFamily: MONO, color: rank === 1 ? "#fbbf24" : rank === 2 ? "#9ca3af" : rank === 3 ? "#b45309" : MUTED }}>#{rank}</div>
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <div style={{ width: 34, height: 34, borderRadius: 9, background: "linear-gradient(135deg,#f59e0b,#fbbf24)", display: "flex", alignItems: "center", justifyContent: "center", color: "#0c0a06", fontWeight: 700, fontSize: 14, flexShrink: 0 }}>{initial(addr)}</div>
+        <div style={{ width: 34, height: 34, borderRadius: 9, background: "linear-gradient(135deg,#f59e0b,#fbbf24)", display: "flex", alignItems: "center", justifyContent: "center", color: "#0c0a06", fontWeight: 700, fontSize: 14, flexShrink: 0 }}>{displayName[0]}</div>
         <div>
-          <div style={{ fontSize: 13, fontWeight: 600 }}>{fmt(addr)}</div>
+          <div style={{ fontSize: 13, fontWeight: 600 }}>{displayName}</div>
           <div style={{ fontSize: 10, color: MUTED, fontFamily: MONO }}>{addr.slice(0, 8)}…</div>
         </div>
       </div>
