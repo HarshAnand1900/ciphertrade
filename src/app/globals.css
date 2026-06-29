@@ -24,3 +24,26 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 8px rgba(245,158,11,.3); }
+  50%       { box-shadow: 0 0 22px rgba(245,158,11,.7); }
+}
+
+/* Encrypt & open button — instant hover/press feedback so the click never feels stuck */
+.ct-encrypt-btn {
+  transition: background .2s, color .2s, transform .1s ease, box-shadow .2s ease !important;
+}
+.ct-encrypt-btn:not(:disabled):hover {
+  transform: translateY(-1px);
+  box-shadow: 0 0 28px rgba(245,158,11,.55) !important;
+  filter: brightness(1.05);
+}
+.ct-encrypt-btn:not(:disabled):active {
+  transform: translateY(0) scale(.97);
+  box-shadow: 0 0 14px rgba(245,158,11,.4) !important;
+}

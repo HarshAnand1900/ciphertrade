@@ -145,7 +145,7 @@ export default function AppPage() {
       {isConnected && (
         <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0, overflow: tab === "chart" ? "hidden" : "auto" }}>
           {tab === "chart" && <ChartTab address={address!} livePrice={livePrice} />}
-          {tab === "discover" && <DiscoverTab address={address!} />}
+          {tab === "discover" && <DiscoverTab address={address!} livePrice={livePrice} />}
           {tab === "following" && <FollowingTab address={address!} />}
           {tab === "portfolio" && <PortfolioTab address={address!} livePrice={livePrice} />}
           {tab === "leaderboard" && <LeaderboardTab />}
@@ -231,32 +231,46 @@ function EncryptionProof({ address, onClose }: { address: string; onClose: () =>
   const [state, setState] = useState<"loading" | "none" | "ready">("loading");
   const [txHash, setTxHash] = useState<string>("");
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const [args, setArgs] = useState<any[]>([]);
+  const [txArgs, setTxArgs] = useState<any[]>([]);
 
   useEffect(() => {
+    if (!publicClient) { setState("none"); return; }
+    let cancelled = false;
     (async () => {
-      if (!publicClient) return;
       try {
         const latest = await publicClient.getBlockNumber();
-        const logs = await publicClient.getLogs({
-          address: CIPHER_TRADE_ADDRESS,
-          event: parseAbiItem("event PositionOpened(address indexed trader, uint256 entryPrice)"),
-          args: { trader: address as `0x${string}` },
-          fromBlock: latest > 50000n ? latest - 50000n : 0n,
-          toBlock: latest,
-        });
-        if (!logs.length) { setState("none"); return; }
-        const hash = logs[logs.length - 1].transactionHash;
-        const tx = await publicClient.getTransaction({ hash });
+        // Don't use args filter — many Sepolia RPCs ignore topic filters silently.
+        // Instead fetch all PositionOpened events for the contract and filter client-side.
+        const spans = [1000n, 3000n, 8000n, 20000n];
+        let found: { hash: `0x${string}`; } | null = null;
+        for (const span of spans) {
+          if (cancelled) return;
+          const from = latest > span ? latest - span : 0n;
+          try {
+            const allLogs = await publicClient.getLogs({
+              address: CIPHER_TRADE_ADDRESS as `0x${string}`,
+              event: parseAbiItem("event PositionOpened(address indexed trader, uint256 entryPrice)"),
+              fromBlock: from,
+              toBlock: latest,
+            });
+            const mine = allLogs.filter(l => (l.args as { trader?: string }).trader?.toLowerCase() === address.toLowerCase());
+            if (mine.length) { found = { hash: mine[mine.length - 1].transactionHash! }; break; }
+          } catch { /* RPC rejected range, widen */ }
+        }
+        if (cancelled) return;
+        if (!found) { setState("none"); return; }
+        const tx = await publicClient.getTransaction({ hash: found.hash });
         const decoded = decodeFunctionData({ abi: CIPHER_TRADE_ABI, data: tx.input });
-        setTxHash(hash);
-        setArgs(decoded.args as unknown as unknown[]);
+        if (cancelled) return;
+        setTxHash(found.hash);
+        setTxArgs(decoded.args as unknown as unknown[]);
         setState("ready");
-      } catch { setState("none"); }
+      } catch { if (!cancelled) setState("none"); }
     })();
+    return () => { cancelled = true; };
   }, [publicClient, address]);
 
-  const short = (h: string) => h.slice(0, 22) + "…" + h.slice(-8);
+  const short = (h: string) => (h?.length > 30 ? h.slice(0, 20) + "…" + h.slice(-8) : h ?? "");
 
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(4,5,7,.75)", backdropFilter: "blur(4px)", zIndex: 120, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
@@ -266,32 +280,57 @@ function EncryptionProof({ address, onClose }: { address: string; onClose: () =>
           <button onClick={onClose} style={{ marginLeft: "auto", background: INNER, border: `1px solid ${BORDER}`, color: MUTED2, borderRadius: 8, width: 30, height: 30, cursor: "pointer", fontSize: 16 }}>×</button>
         </div>
         <div style={{ fontSize: 12.5, color: MUTED, lineHeight: 1.55, marginBottom: 18 }}>
-          This is the <b style={{ color: "#eef2f6" }}>actual data your last trade wrote to the public blockchain</b>, read back live. Notice the direction, size and leverage are unreadable ciphertext — the values you typed appear nowhere.
+          This is the <b style={{ color: "#eef2f6" }}>actual data your last trade wrote to the public blockchain</b>, read back live. Direction, size and leverage are unreadable ciphertext — the values you typed appear nowhere.
         </div>
 
-        {state === "loading" && <div style={{ color: MUTED2, fontSize: 13, padding: "20px 0", textAlign: "center" }}>Reading your transaction from chain…</div>}
-        {state === "none" && <div style={{ color: MUTED2, fontSize: 13, padding: "20px 0", textAlign: "center" }}>No openPosition transaction found yet. Open a position first, then come back.</div>}
+        {state === "loading" && (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, color: MUTED2, fontSize: 13, padding: "24px 0" }}>
+            <span style={{ width: 14, height: 14, border: "2px solid #2a3540", borderTopColor: AMBER, borderRadius: "50%", display: "inline-block", animation: "spin .8s linear infinite" }} />
+            Scanning chain for your transaction…
+          </div>
+        )}
+        {state === "none" && (
+          <div style={{ color: MUTED2, fontSize: 13, padding: "20px 0", textAlign: "center" }}>
+            No openPosition transaction found in recent blocks.<br />
+            <span style={{ fontSize: 11 }}>Open a position first, then re-open this panel.</span>
+          </div>
+        )}
         {state === "ready" && (
           <>
             {[
-              { label: "Direction (long/short)", val: args[0] as string, enc: true },
-              { label: "Size (units)", val: args[1] as string, enc: true },
-              { label: "Leverage (1×–20×)", val: args[2] as string, enc: true },
-              { label: "Entry price (public by design)", val: "$" + (Number(args[4]) / 1e6).toFixed(2), enc: false },
+              { label: "Direction (long/short)", val: txArgs[0] as string, enc: true },
+              { label: "Size (units)", val: txArgs[1] as string, enc: true },
+              { label: "Leverage (1×–20×)", val: txArgs[2] as string, enc: true },
+              { label: "Entry price (public by design)", val: "$" + (Number(txArgs[4]) / 1e6).toFixed(2), enc: false },
             ].map(r => (
               <div key={r.label} style={{ display: "flex", alignItems: "center", gap: 12, background: INNER, borderRadius: 9, padding: "11px 14px", marginBottom: 8 }}>
-                <div style={{ minWidth: 200 }}>
+                <div style={{ minWidth: 190 }}>
                   <div style={{ fontSize: 12, fontWeight: 600 }}>{r.label}</div>
-                  <div style={{ fontSize: 10, color: r.enc ? "#fbbf24" : GREEN, fontFamily: MONO, marginTop: 2 }}>{r.enc ? "🔒 ENCRYPTED CIPHERTEXT" : "● public"}</div>
+                  <div style={{ fontSize: 10, color: r.enc ? "#fbbf24" : GREEN, fontFamily: MONO, marginTop: 2 }}>{r.enc ? "🔒 ENCRYPTED CIPHERTEXT" : "● public uint256"}</div>
                 </div>
-                <div style={{ flex: 1, fontFamily: MONO, fontSize: 12, color: r.enc ? "#7d8896" : "#eef2f6", wordBreak: "break-all", textAlign: "right" }}>{r.enc ? short(r.val) : r.val}</div>
+                <div style={{ flex: 1, fontFamily: MONO, fontSize: 11, color: r.enc ? "#5b6168" : "#eef2f6", wordBreak: "break-all", textAlign: "right" }}>{r.enc ? short(r.val) : r.val}</div>
               </div>
             ))}
-            <a href={`https://sepolia.etherscan.io/tx/${txHash}#statechange`} target="_blank" rel="noreferrer" style={{ display: "block", marginTop: 14, fontSize: 12, fontFamily: MONO, color: AMBER, textAlign: "center", textDecoration: "underline" }}>
-              verify this exact transaction on Etherscan ↗
-            </a>
           </>
         )}
+
+        {/* Always show explorer links */}
+        <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+          {txHash ? (
+            <a href={`https://sepolia.etherscan.io/tx/${txHash}`} target="_blank" rel="noreferrer"
+              style={{ flex: 1, display: "block", padding: "9px 0", fontSize: 12, fontFamily: MONO, color: AMBER, textAlign: "center", textDecoration: "none", background: "#1a150a", border: "1px solid #5e4a24", borderRadius: 9 }}>
+              View tx on Etherscan ↗
+            </a>
+          ) : (
+            <div style={{ flex: 1, padding: "9px 0", fontSize: 12, fontFamily: MONO, color: MUTED2, textAlign: "center", background: INNER, border: `1px solid ${BORDER}`, borderRadius: 9 }}>
+              {state === "loading" ? "Loading tx…" : "Tx not found"}
+            </div>
+          )}
+          <a href={`https://sepolia.etherscan.io/address/${CIPHER_TRADE_ADDRESS}#code`} target="_blank" rel="noreferrer"
+            style={{ flex: 1, display: "block", padding: "9px 0", fontSize: 12, fontFamily: MONO, color: MUTED, textAlign: "center", textDecoration: "none", background: INNER, border: `1px solid ${BORDER}`, borderRadius: 9 }}>
+            View contract ↗
+          </a>
+        </div>
       </div>
     </div>
   );
@@ -359,21 +398,48 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
   const { data: isOpen, refetch: refetchOpen } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "isPositionOpen", args: [address as `0x${string}`], query: { enabled: !!address, staleTime: 10_000 } }) as { data: boolean | undefined; refetch: () => void };
   const { data: stakedFlag, refetch: refetchStake } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "staked", args: [address as `0x${string}`], query: { enabled: !!address, staleTime: 30_000 } }) as { data: boolean | undefined; refetch: () => void };
   const { data: followerCount } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getFollowerCount", args: [address as `0x${string}`], query: { enabled: !!address, staleTime: 30_000 } }) as { data: bigint | undefined };
+  const { data: tpslSet, refetch: refetchTpsl } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "hasTPSL", args: [address as `0x${string}`], query: { enabled: !!address && !!isOpen, staleTime: 15_000 } }) as { data: boolean | undefined; refetch: () => void };
 
-  const refetchAll = useCallback(() => { refetchOpen(); refetchStake(); refetchPosition(); }, [refetchOpen, refetchStake, refetchPosition]);
+  const refetchAll = useCallback(() => { refetchOpen(); refetchStake(); refetchPosition(); refetchTpsl(); }, [refetchOpen, refetchStake, refetchPosition, refetchTpsl]);
   const isStaked = !!stakedFlag;
   const entryPrice = positionData ? Number(positionData[1]) / 1e6 : 0;
   const fCount = Number(followerCount ?? 0n);
 
-  // unrealized P&L
-  const unrealizedPct = isOpen && entryPrice > 0 ? ((livePrice - entryPrice) / entryPrice * 100) : 0;
-  const unrealizedBps = Math.round(unrealizedPct * 100);
-  const pnlPositive = unrealizedPct >= 0;
-
   // form state
   const [dir, setDir] = useState<Dir>("LONG");
   const [size, setSize] = useState("2500");
-  const [lev, setLev] = useState(2); // leverage 1x–10x (encrypted)
+  const [lev, setLev] = useState(2);
+  // TP/SL — stored in localStorage so user can see what they set after encryption
+  const tpslKey = `ct_tpsl_${address}`;
+  const [savedTpSl, setSavedTpSl] = useState<{ tp: string; sl: string } | null>(() => {
+    if (typeof window === "undefined") return null;
+    try { return JSON.parse(localStorage.getItem(`ct_tpsl_${address}`) || "null"); } catch { return null; }
+  });
+  const [tp, setTp] = useState(savedTpSl?.tp ?? "");
+  const [sl, setSl] = useState(savedTpSl?.sl ?? "");
+  // The trader's own view of their (encrypted) position params, from localStorage.
+  const posParamsKey = `ct_posparams_${address}`;
+  // posMeta is either { dir,size,lev } (you opened it) or { copied,leader } (you
+  // mirrored someone — its values are encrypted even to you).
+  const [posMeta, setOpenParams] = useState<{ dir?: Dir; size?: number; lev?: number; copied?: boolean; leader?: string } | null>(() => {
+    if (typeof window === "undefined") return null;
+    try { return JSON.parse(localStorage.getItem(`ct_posparams_${address}`) || "null"); } catch { return null; }
+  });
+  const openParams = posMeta && posMeta.dir ? (posMeta as { dir: Dir; size: number; lev: number }) : null;
+  const copiedFrom = posMeta && posMeta.copied ? posMeta.leader ?? null : null;
+  // Whether we can show a real P&L for the user's own position. A mirrored/copied
+  // position is sealed even to its owner, so we must NOT show a long-assumed number.
+  const canSeeOwn = !!openParams;
+  // unrealized P&L — direction-aware (short inverts), leverage-scaled to match settlement
+  const posIsLong = openParams ? openParams.dir === "LONG" : true;
+  const posLev = openParams?.lev ?? 1;
+  const rawMovePct = isOpen && entryPrice > 0 ? ((livePrice - entryPrice) / entryPrice * 100) : 0;
+  const unrealizedPct = (posIsLong ? rawMovePct : -rawMovePct) * posLev;
+  const unrealizedBps = Math.round(unrealizedPct * 100);
+  const pnlPositive = unrealizedPct >= 0;
+
+  const [showTpSl, setShowTpSl] = useState(false);
+  const [editTpSl, setEditTpSl] = useState(false);
   const [loading, setLoading] = useState(false);
   const [statusMsg, setStatusMsg] = useState("");
   const [statusOk, setStatusOk] = useState(false);
@@ -440,6 +506,11 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
     chartRef.current?.timeScale().fitContent();
   }, [candles]);
 
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const tpLineRef = useRef<any>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const slLineRef = useRef<any>(null);
+
   // entry price line
   useEffect(() => {
     if (!seriesRef.current) return;
@@ -452,11 +523,26 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
     }
   }, [isOpen, entryPrice]);
 
+  // TP/SL price lines on chart
+  useEffect(() => {
+    if (!seriesRef.current) return;
+    if (tpLineRef.current) { try { seriesRef.current.removePriceLine(tpLineRef.current); } catch { /**/ } tpLineRef.current = null; }
+    if (slLineRef.current) { try { seriesRef.current.removePriceLine(slLineRef.current); } catch { /**/ } slLineRef.current = null; }
+    if (isOpen && savedTpSl) {
+      const tpVal = Number(savedTpSl.tp);
+      const slVal = Number(savedTpSl.sl);
+      if (tpVal > 0) tpLineRef.current = seriesRef.current.createPriceLine({ price: tpVal, color: "#4ade80", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "🔒 TP" });
+      if (slVal > 0) slLineRef.current = seriesRef.current.createPriceLine({ price: slVal, color: "#f87171", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "🔒 SL" });
+    }
+  }, [isOpen, savedTpSl]);
+
   async function handleOpen() {
     if (!size || !walletClient) return;
-    setLoading(true); setStatusMsg(""); setEncrypting(true);
+    setLoading(true); setStatusMsg("Initializing FHE…"); setEncrypting(true);
     try {
-      setStatusMsg("Initializing FHE…");
+      // Let the browser paint the loading state BEFORE the synchronous FHE WASM
+      // work blocks the main thread — otherwise the button feels frozen on first click.
+      await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
       const fhevm = await getFhevm(); // cached/preloaded singleton
       setStatusMsg("Encrypting…");
       const input = fhevm.createEncryptedInput(CIPHER_TRADE_ADDRESS, address);
@@ -468,6 +554,11 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
       const hash = await writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "openPosition", args: [toHex(encrypted.handles[0]), toHex(encrypted.handles[1]), toHex(encrypted.handles[2]), toHex(encrypted.inputProof), price6] });
       setStatusMsg("Confirming…");
       await publicClient?.waitForTransactionReceipt({ hash });
+      // Store the trader's own view of their params (display only; settlement
+      // decrypts the real ciphertext server-side and never trusts this).
+      const params = { dir, size: Math.floor(Number(size)), lev };
+      localStorage.setItem(posParamsKey, JSON.stringify(params));
+      setOpenParams(params);
       setOk("Position sealed on-chain."); refetchAll();
     } catch (e: unknown) { setErr((e instanceof Error ? e.message.slice(0, 100) : String(e))); }
     setEncrypting(false); setLoading(false);
@@ -480,7 +571,22 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
       const hash = await writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "closePosition", args: [price6] });
       setStatusMsg("Confirming…");
       await publicClient?.waitForTransactionReceipt({ hash });
-      setOk("Position closed. Awaiting KMS settlement."); refetchAll();
+      localStorage.removeItem(tpslKey);
+      setSavedTpSl(null); setTp(""); setSl("");
+      // Auto-settle: the server decrypts the REAL on-chain ciphertext (direction,
+      // size, leverage) and submits it. We only pass the trader address — no
+      // plaintext is trusted from the browser.
+      setStatusMsg("Settling…");
+      try {
+        await fetch("/api/settle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ trader: address }),
+        });
+      } catch { /* settle errors are non-fatal; KMS can settle later */ }
+      localStorage.removeItem(posParamsKey);
+      setOpenParams(null);
+      setOk("Position closed & settled."); refetchAll();
     } catch (e: unknown) { setErr((e instanceof Error ? e.message.slice(0, 100) : String(e))); }
     setLoading(false);
   }
@@ -493,6 +599,32 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
       setOk(isStaked ? "Unstaked." : "Staked. 18% fee enabled."); refetchStake();
     } catch (e: unknown) { setErr((e instanceof Error ? e.message.slice(0, 100) : String(e))); }
     setLoading(false);
+  }
+
+  async function handleSetTpSl() {
+    if (!tp || !sl || !walletClient) return;
+    setLoading(true); setStatusMsg(""); setEncrypting(true);
+    try {
+      setStatusMsg("Encrypting TP/SL…");
+      const fhevm = await getFhevm();
+      const input = fhevm.createEncryptedInput(CIPHER_TRADE_ADDRESS, address);
+      input.add64(BigInt(Math.round(Number(tp) * 1e6)));
+      input.add64(BigInt(Math.round(Number(sl) * 1e6)));
+      const encrypted = await input.encrypt();
+      setStatusMsg("Broadcasting…");
+      const hash = await writeContractAsync({
+        address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "setTPSL",
+        args: [toHex(encrypted.handles[0]), toHex(encrypted.handles[1]), toHex(encrypted.inputProof)],
+      });
+      setStatusMsg("Confirming…");
+      await publicClient?.waitForTransactionReceipt({ hash });
+      // Persist locally so user can see their own encrypted targets
+      const saved = { tp, sl };
+      localStorage.setItem(tpslKey, JSON.stringify(saved));
+      setSavedTpSl(saved);
+      setOk("🔒 TP/SL sealed on-chain."); refetchTpsl(); setShowTpSl(false); setEditTpSl(false);
+    } catch (e: unknown) { setErr((e instanceof Error ? e.message.slice(0, 100) : String(e))); }
+    setEncrypting(false); setLoading(false);
   }
 
   const last = candles[candles.length - 1] ?? { o: livePrice, h: livePrice, l: livePrice, c: livePrice, v: 0, t: 0 };
@@ -544,12 +676,17 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
         <div style={{ display: "flex", flexDirection: "column", padding: "12px 12px 10px 16px", borderRight: `1px solid ${BORDER2}`, gap: 8, minWidth: 0, overflow: "hidden" }}>
           {/* TF + OHLC row */}
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
-            <div style={{ display: "flex", gap: 3 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
               {["15m", "1H", "4H", "1D"].map(t => (
                 <button key={t} onClick={() => setTf(t)} style={{ padding: "4px 11px", borderRadius: 7, fontSize: 12, fontWeight: 600, fontFamily: MONO, border: "none", cursor: "pointer", background: tf === t ? "#1e2a36" : "transparent", color: tf === t ? "#eef2f6" : MUTED2 }}>
                   {t}
                 </button>
               ))}
+              <div style={{ width: 1, height: 14, background: BORDER, margin: "0 3px" }} />
+              <button onClick={() => setShowProof(true)} style={{ background: "#241b0c", border: "1px solid #5e4a24", color: "#fbbf24", fontFamily: MONO, fontSize: 10.5, padding: "3px 9px", borderRadius: 6, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}>
+                <span style={{ width: 5, height: 5, borderRadius: "50%", background: AMBER, display: "inline-block", animation: "pulse-glow 2s ease-in-out infinite" }} />
+                🔒 Proof of encryption
+              </button>
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 12, fontSize: 11, fontFamily: MONO, color: MUTED2 }}>
               <span>O <span style={{ color: "#aeb8c4" }}>${last.o.toFixed(2)}</span></span>
@@ -579,7 +716,6 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
               encrypted size euint64:
             </span>
             <span>size=<span style={{ color: "#7d8896" }}>{cipherSize}</span></span>
-            <button onClick={() => setShowProof(true)} style={{ background: "#241b0c", border: "1px solid #5e4a24", color: "#fbbf24", fontFamily: MONO, fontSize: 10.5, padding: "3px 9px", borderRadius: 6, cursor: "pointer" }}>🔒 Proof of encryption</button>
             <span style={{ marginLeft: "auto", color: GREEN, display: "flex", alignItems: "center", gap: 5 }}>● chain stores ciphertext only</span>
           </div>
         </div>
@@ -590,21 +726,26 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
           {isOpen ? (
             <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 13, padding: 14, flexShrink: 0 }}>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 11 }}>
-                <span style={{ fontSize: 12, fontWeight: 600, color: "#aeb8c4" }}>Your position</span>
+                <span style={{ fontSize: 12, fontWeight: 600, color: "#aeb8c4" }}>{copiedFrom ? "Mirrored position" : "Your position"}</span>
                 <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10, color: GREEN, background: "rgba(74,222,128,.08)", padding: "3px 9px", borderRadius: 20, fontWeight: 600, border: "1px solid rgba(74,222,128,.15)" }}>
                   <span style={{ width: 5, height: 5, borderRadius: "50%", background: GREEN, display: "inline-block" }} />OPEN
                 </span>
               </div>
+              {copiedFrom && (
+                <div style={{ fontSize: 10, color: "#fbbf24", background: "#241b0c", border: "1px solid #5e4a24", borderRadius: 8, padding: "7px 10px", marginBottom: 8, fontFamily: MONO, lineHeight: 1.4 }}>
+                  🔒 Copied from {fmt(copiedFrom)} — direction, size &amp; P&L are encrypted even to you, revealed only at settlement.
+                </div>
+              )}
               <div style={{ display: "flex", gap: 7, marginBottom: 8 }}>
                 <div style={{ flex: 1, background: INNER, borderRadius: 9, padding: 10 }}>
                   <div style={{ fontSize: 9, color: MUTED2, marginBottom: 3 }}>Direction</div>
-                  <div style={{ fontSize: 14, fontWeight: 700, color: GREEN }}>▲ Long</div>
-                  <div style={{ fontSize: 9, color: MUTED2, marginTop: 2, fontFamily: MONO }}>🔒 sealed</div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: canSeeOwn ? (posIsLong ? GREEN : RED_SOFT) : MUTED }}>{canSeeOwn ? (posIsLong ? "▲ Long" : "▼ Short") : "🔒 Sealed"}</div>
+                  <div style={{ fontSize: 9, color: MUTED2, marginTop: 2, fontFamily: MONO }}>{canSeeOwn ? "🔒 sealed to others" : "encrypted"}</div>
                 </div>
                 <div style={{ flex: 1, background: INNER, borderRadius: 9, padding: 10 }}>
-                  <div style={{ fontSize: 9, color: MUTED2, marginBottom: 3 }}>Size</div>
-                  <div style={{ fontSize: 14, fontWeight: 700, fontFamily: MONO }}>—</div>
-                  <div style={{ fontSize: 9, color: MUTED2, marginTop: 2, fontFamily: MONO }}>🔒 sealed</div>
+                  <div style={{ fontSize: 9, color: MUTED2, marginBottom: 3 }}>Size {canSeeOwn && openParams ? `· ${openParams.lev}×` : ""}</div>
+                  <div style={{ fontSize: 14, fontWeight: 700, fontFamily: MONO }}>{canSeeOwn && openParams ? openParams.size.toLocaleString() : "🔒"}</div>
+                  <div style={{ fontSize: 9, color: MUTED2, marginTop: 2, fontFamily: MONO }}>{canSeeOwn ? "🔒 sealed to others" : "encrypted"}</div>
                 </div>
               </div>
               <div style={{ display: "flex", gap: 7, marginBottom: 8 }}>
@@ -617,13 +758,72 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
                   <div style={{ fontSize: 13, fontWeight: 600, fontFamily: MONO, color: AMBER }}>${livePrice.toFixed(2)}</div>
                 </div>
               </div>
-              <div style={{ background: pnlPositive ? "rgba(34,197,94,.07)" : "rgba(239,68,68,.07)", borderRadius: 10, padding: 11, marginBottom: 11 }}>
-                <div style={{ fontSize: 9, color: pnlPositive ? "rgba(74,222,128,.7)" : "rgba(252,165,165,.7)", marginBottom: 1 }}>Unrealized P&L</div>
-                <div style={{ fontSize: 24, fontWeight: 700, color: pnlPositive ? GREEN : RED_SOFT, fontFamily: MONO, lineHeight: 1.1 }}>{pnlPositive ? "+" : ""}{unrealizedPct.toFixed(2)}%</div>
-                <div style={{ fontSize: 10, color: pnlPositive ? "rgba(74,222,128,.7)" : "rgba(252,165,165,.7)", marginTop: 1, fontFamily: MONO }}>{pnlPositive ? "+" : ""}{unrealizedBps} bps</div>
-              </div>
-              <button onClick={handleClose} disabled={loading} style={{ width: "100%", padding: 10, border: "1px solid rgba(252,165,165,.2)", background: "rgba(252,165,165,.06)", color: RED_SOFT, fontSize: 12, fontWeight: 600, borderRadius: 9, cursor: "pointer", fontFamily: SANS }}>
-                {loading ? statusMsg || "Closing…" : "Close & settle"}
+              {canSeeOwn ? (
+                <div style={{ background: pnlPositive ? "rgba(34,197,94,.07)" : "rgba(239,68,68,.07)", borderRadius: 10, padding: 11, marginBottom: 11 }}>
+                  <div style={{ fontSize: 9, color: pnlPositive ? "rgba(74,222,128,.7)" : "rgba(252,165,165,.7)", marginBottom: 1 }}>Unrealized P&L</div>
+                  <div style={{ fontSize: 24, fontWeight: 700, color: pnlPositive ? GREEN : RED_SOFT, fontFamily: MONO, lineHeight: 1.1 }}>{pnlPositive ? "+" : ""}{unrealizedPct.toFixed(2)}%</div>
+                  <div style={{ fontSize: 10, color: pnlPositive ? "rgba(74,222,128,.7)" : "rgba(252,165,165,.7)", marginTop: 1, fontFamily: MONO }}>{pnlPositive ? "+" : ""}{unrealizedBps} bps</div>
+                </div>
+              ) : (
+                <div style={{ background: "rgba(245,158,11,.06)", border: "1px solid #5e4a24", borderRadius: 10, padding: 11, marginBottom: 11 }}>
+                  <div style={{ fontSize: 9, color: "rgba(251,191,36,.7)", marginBottom: 2 }}>Unrealized P&L</div>
+                  <div style={{ fontSize: 18, fontWeight: 700, color: "#fbbf24", fontFamily: MONO, lineHeight: 1.1 }}>🔒 Sealed</div>
+                  <div style={{ fontSize: 10, color: MUTED2, marginTop: 2, fontFamily: MONO }}>computed on close — even you can&apos;t peek</div>
+                </div>
+              )}
+              {/* TP/SL card */}
+              {(!tpslSet && !savedTpSl) || editTpSl ? (
+                <div style={{ marginBottom: 11 }}>
+                  {(!showTpSl && !editTpSl) ? (
+                    <button onClick={() => setShowTpSl(true)} style={{ width: "100%", padding: "8px 0", border: "1px solid #1e3a2a", background: "rgba(34,197,94,.05)", color: GREEN, fontSize: 11, fontWeight: 600, borderRadius: 9, cursor: "pointer", fontFamily: SANS }}>
+                      🔒 Set encrypted TP/SL
+                    </button>
+                  ) : (
+                    <div style={{ background: INNER, border: `1px solid ${BORDER}`, borderRadius: 10, padding: 11 }}>
+                      <div style={{ fontSize: 10, color: GREEN, fontWeight: 600, marginBottom: 5 }}>🔒 {editTpSl ? "Edit" : "Encrypt"} Take-Profit / Stop-Loss</div>
+                      <div style={{ fontSize: 9, color: MUTED2, marginBottom: 8, lineHeight: 1.4 }}>Sealed on-chain — copiers &amp; front-runners can never see your targets.</div>
+                      <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontSize: 9, color: GREEN, marginBottom: 3 }}>Take Profit $</div>
+                          <input type="number" value={tp} onChange={e => setTp(e.target.value)} placeholder={(livePrice * 1.05).toFixed(0)} style={{ width: "100%", background: "#0a120a", border: "1px solid #1e3a2a", borderRadius: 7, padding: "7px 9px", color: "#eef2f6", fontSize: 13, fontFamily: MONO, boxSizing: "border-box" }} />
+                        </div>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontSize: 9, color: RED_SOFT, marginBottom: 3 }}>Stop Loss $</div>
+                          <input type="number" value={sl} onChange={e => setSl(e.target.value)} placeholder={(livePrice * 0.95).toFixed(0)} style={{ width: "100%", background: "#120a0a", border: "1px solid #3a1e1e", borderRadius: 7, padding: "7px 9px", color: "#eef2f6", fontSize: 13, fontFamily: MONO, boxSizing: "border-box" }} />
+                        </div>
+                      </div>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <button onClick={() => { setShowTpSl(false); setEditTpSl(false); }} style={{ flex: 1, padding: "7px 0", background: "transparent", border: `1px solid ${BORDER}`, color: MUTED2, fontSize: 11, borderRadius: 8, cursor: "pointer" }}>Cancel</button>
+                        <button onClick={handleSetTpSl} disabled={loading || !tp || !sl} style={{ flex: 2, padding: "7px 0", background: (!tp || !sl) ? "#131a22" : "rgba(34,197,94,.12)", border: "1px solid #1e3a2a", color: GREEN, fontSize: 11, fontWeight: 600, borderRadius: 8, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                          {loading ? <><span style={{ width: 10, height: 10, border: "2px solid #1a3a20", borderTopColor: GREEN, borderRadius: "50%", display: "inline-block", animation: "spin .7s linear infinite" }} />{statusMsg || "Encrypting…"}</> : "🔒 Seal TP/SL"}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div style={{ background: "rgba(34,197,94,.04)", border: "1px solid #1e3a2a", borderRadius: 9, padding: "9px 11px", marginBottom: 11 }}>
+                  <div style={{ display: "flex", alignItems: "center", marginBottom: savedTpSl ? 7 : 0 }}>
+                    <span style={{ fontSize: 11, fontWeight: 600, color: GREEN }}>🔒 TP/SL sealed on-chain</span>
+                    <button onClick={() => { setTp(savedTpSl?.tp ?? ""); setSl(savedTpSl?.sl ?? ""); setEditTpSl(true); setShowTpSl(true); }} style={{ marginLeft: "auto", fontSize: 10, color: MUTED2, background: "transparent", border: "none", cursor: "pointer", fontFamily: MONO }}>Edit ✎</button>
+                  </div>
+                  {savedTpSl && (
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <div style={{ flex: 1, background: "#0a120a", borderRadius: 7, padding: "6px 8px" }}>
+                        <div style={{ fontSize: 8, color: GREEN, marginBottom: 1 }}>TP (you set)</div>
+                        <div style={{ fontSize: 13, fontWeight: 600, fontFamily: MONO, color: GREEN }}>${Number(savedTpSl.tp).toLocaleString()}</div>
+                      </div>
+                      <div style={{ flex: 1, background: "#120a0a", borderRadius: 7, padding: "6px 8px" }}>
+                        <div style={{ fontSize: 8, color: RED_SOFT, marginBottom: 1 }}>SL (you set)</div>
+                        <div style={{ fontSize: 13, fontWeight: 600, fontFamily: MONO, color: RED_SOFT }}>${Number(savedTpSl.sl).toLocaleString()}</div>
+                      </div>
+                    </div>
+                  )}
+                  <div style={{ fontSize: 9, color: MUTED2, marginTop: 5, fontFamily: MONO }}>encrypted on-chain · invisible to copiers</div>
+                </div>
+              )}
+              <button onClick={handleClose} disabled={loading} style={{ width: "100%", padding: 10, border: "1px solid rgba(252,165,165,.2)", background: "rgba(252,165,165,.06)", color: RED_SOFT, fontSize: 12, fontWeight: 600, borderRadius: 9, cursor: loading ? "not-allowed" : "pointer", fontFamily: SANS, display: "flex", alignItems: "center", justifyContent: "center", gap: 7 }}>
+                {loading ? <><span style={{ width: 12, height: 12, border: "2px solid rgba(252,165,165,.2)", borderTopColor: RED_SOFT, borderRadius: "50%", display: "inline-block", animation: "spin .7s linear infinite", flexShrink: 0 }} />{statusMsg || "Closing…"}</> : "Close & settle"}
               </button>
             </div>
           ) : (
@@ -658,8 +858,10 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
                   </div>
                 ))}
               </div>
-              <button onClick={handleOpen} disabled={loading || !size} style={{ width: "100%", padding: 12, border: "none", background: size ? AMBER : "#1a2030", color: size ? "#0c0a06" : MUTED, fontSize: 13, fontWeight: 700, borderRadius: 10, cursor: size ? "pointer" : "not-allowed", fontFamily: SANS, display: "flex", alignItems: "center", justifyContent: "center", gap: 7, boxShadow: size ? "0 0 18px rgba(245,158,11,.25)" : "none" }}>
-                🔒 {loading ? (statusMsg || "Processing…") : "Encrypt & open"}
+              <button onClick={handleOpen} disabled={loading || !size} className="ct-encrypt-btn" style={{ width: "100%", padding: 12, border: "none", background: loading ? "#2a1e00" : size ? AMBER : "#1a2030", color: loading ? AMBER : size ? "#0c0a06" : MUTED, fontSize: 13, fontWeight: 700, borderRadius: 10, cursor: (loading || !size) ? "not-allowed" : "pointer", fontFamily: SANS, display: "flex", alignItems: "center", justifyContent: "center", gap: 7, boxShadow: (!loading && size) ? "0 0 18px rgba(245,158,11,.25)" : "none" }}>
+                {loading
+                  ? <><span style={{ width: 13, height: 13, border: "2px solid #5e4a00", borderTopColor: AMBER, borderRadius: "50%", display: "inline-block", animation: "spin .7s linear infinite", flexShrink: 0 }} />{statusMsg || "Processing…"}</>
+                  : <>🔒 Encrypt &amp; open</>}
               </button>
             </div>
           )}
@@ -741,13 +943,12 @@ function UsernameSearch() {
 // ═══════════════════════════════════════════════════════════════════════════════
 // DISCOVER TAB
 // ═══════════════════════════════════════════════════════════════════════════════
-function DiscoverTab({ address }: { address: string }) {
+function DiscoverTab({ address, livePrice }: { address: string; livePrice: number }) {
   const [following, setFollowing] = useState<Set<string>>(() => {
     if (typeof window === "undefined") return new Set();
     try { return new Set(JSON.parse(localStorage.getItem("ct_following") || "[]")); } catch { return new Set(); }
   });
   const [followModal, setFollowModal] = useState<string | null>(null);
-  const [allocation, setAllocation] = useState(1000);
   const [loading, setLoading] = useState(false);
 
   const { data: traderAddrs } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getTraders", query: { staleTime: 30_000 } }) as { data: readonly `0x${string}`[] | undefined };
@@ -780,10 +981,25 @@ function DiscoverTab({ address }: { address: string }) {
     if (!followModal) return;
     setLoading(true); setFollowErr("");
     try {
-      const hash = await writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "followTrader", args: [followModal as `0x${string}`, BigInt(allocation)] });
+      // Homomorphic copy: opens a sealed mirror of the leader's encrypted position
+      // for the follower at the current entry price. No value is ever decrypted.
+      const price6 = BigInt(Math.round(livePrice * 1e6));
+      const hash = await writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "copyTrade", args: [followModal as `0x${string}`, 1n, price6] });
       await publicClient?.waitForTransactionReceipt({ hash });
+      // Mark this as a mirrored position the follower CANNOT introspect — its
+      // direction/size are encrypted even to them. The Chart/Portfolio tabs read
+      // this to show a sealed view instead of a misleading long-assumed P&L.
+      localStorage.setItem(`ct_posparams_${address}`, JSON.stringify({ copied: true, leader: followModal }));
       toggleFollow(followModal); setFollowModal(null);
-    } catch (e) { setFollowErr(e instanceof Error && e.message.includes("no open position") ? "trader has no open position to copy" : "follow failed"); }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "";
+      setFollowErr(
+        msg.includes("no open position") ? "trader has no open position to copy"
+        : msg.includes("close your position") ? "close your own position before copying"
+        : msg.includes("cannot copy yourself") ? "you can't copy your own position"
+        : "copy failed"
+      );
+    }
     setLoading(false);
   }
 
@@ -834,16 +1050,19 @@ function DiscoverTab({ address }: { address: string }) {
               <div style={{ width: 40, height: 40, borderRadius: 11, background: "linear-gradient(135deg,#f59e0b,#fbbf24)", display: "flex", alignItems: "center", justifyContent: "center", color: "#0c0a06", fontWeight: 700, fontSize: 17 }}>{initial(followModal)}</div>
               <div><div style={{ fontSize: 16, fontWeight: 600 }}>Follow {fmt(followModal)}</div><div style={{ fontSize: 11, color: MUTED, fontFamily: MONO }}>Sepolia testnet</div></div>
             </div>
-            <div style={{ fontSize: 12, color: MUTED, lineHeight: 1.55, margin: "12px 0 18px" }}>Your allocation is copied proportionally into each new position. You never see direction or size — settlement pays pro-rata minus the performance fee.</div>
-            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 8 }}>
-              <div style={{ fontSize: 11, color: MUTED }}>Allocation</div>
-              <div style={{ fontSize: 24, fontWeight: 700, fontFamily: MONO }}>{allocation} <span style={{ fontSize: 12, color: MUTED }}>cUSDT</span></div>
+            <div style={{ fontSize: 12, color: MUTED, lineHeight: 1.55, margin: "12px 0 16px" }}>This opens a <b style={{ color: "#eef2f6" }}>1:1 sealed mirror</b> of their position — their encrypted direction, size &amp; leverage are copied straight into yours under FHE. You never see the values, and neither does the mempool. You close &amp; settle it on your own entry/exit.</div>
+            <div style={{ background: INNER, border: `1px solid ${BORDER}`, borderRadius: 10, padding: "12px 14px", marginBottom: 18, display: "flex", flexDirection: "column", gap: 8 }}>
+              {[["Mirror", "1:1 of leader's sealed position"], ["Entry price", "$" + livePrice.toFixed(2)], ["Visible to you", "🔒 nothing until settlement"]].map(([k, v]) => (
+                <div key={k} style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
+                  <span style={{ color: MUTED }}>{k}</span>
+                  <span style={{ fontFamily: MONO, color: "#eef2f6" }}>{v}</span>
+                </div>
+              ))}
             </div>
-            <input type="range" min={100} max={10000} step={100} value={allocation} onChange={e => setAllocation(Number(e.target.value))} style={{ width: "100%", marginBottom: 20 }} />
             {followErr && <div style={{ fontSize: 11, color: RED_SOFT, fontFamily: MONO, marginBottom: 12, textAlign: "center" }}>{followErr}</div>}
             <div style={{ display: "flex", gap: 10 }}>
               <button onClick={() => setFollowModal(null)} style={{ flex: 1, padding: 12, background: "#131a22", border: `1px solid ${BORDER}`, color: "#aeb8c4", fontSize: 13, fontWeight: 600, borderRadius: 11, cursor: "pointer" }}>Cancel</button>
-              <button onClick={confirmFollow} disabled={loading} style={{ flex: 2, padding: 12, background: AMBER, border: "none", color: "#0c0a06", fontSize: 13, fontWeight: 700, borderRadius: 11, cursor: "pointer" }}>{loading ? "Confirming…" : "Confirm follow"}</button>
+              <button onClick={confirmFollow} disabled={loading} style={{ flex: 2, padding: 12, background: AMBER, border: "none", color: "#0c0a06", fontSize: 13, fontWeight: 700, borderRadius: 11, cursor: loading ? "not-allowed" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 7 }}>{loading ? <><span style={{ width: 12, height: 12, border: "2px solid #5e4a00", borderTopColor: "#0c0a06", borderRadius: "50%", display: "inline-block", animation: "spin .7s linear infinite" }} />Mirroring…</> : "🔒 Copy position"}</button>
             </div>
           </div>
         </div>
@@ -976,9 +1195,9 @@ function FollowingTab({ address }: { address: string }) {
     <div style={{ padding: "18px 22px", maxWidth: 1240, margin: "0 auto", width: "100%", overflowY: "auto" }}>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 10, marginBottom: 20 }}>
         {[
-          { label: "Total allocated", value: followed.length * 500 + " cUSDT", color: "#eef2f6" },
-          { label: "Est. total P&L", value: "—", color: GREEN },
-          { label: "Active positions", value: followed.length.toString(), color: "#eef2f6" },
+          { label: "Mirrored traders", value: followed.length.toString(), color: "#eef2f6" },
+          { label: "Est. total P&L", value: "🔒 on settle", color: "#fbbf24" },
+          { label: "Mirror type", value: "1:1 sealed", color: "#eef2f6" },
           { label: "Your address", value: fmt(address), color: AMBER },
         ].map(s => (
           <div key={s.label} style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 12, padding: 15 }}>
@@ -1085,7 +1304,7 @@ function FollowingRow({ addr, prefetchedStats, prefetchedPosOpen, prefetchedUser
         </div>
       </div>
       <div style={{ display: "flex", gap: 8 }}>
-        {[["Direction", "🔒 sealed"], ["Size", "🔒 sealed"], ["Your alloc", "500 cUSDT"], ["Since", "now"]].map(([k, v]) => (
+        {[["Direction", "🔒 sealed"], ["Size", "🔒 sealed"], ["Copy", "1:1 mirror"], ["Since", "now"]].map(([k, v]) => (
           <div key={k} style={{ background: INNER, borderRadius: 8, padding: "8px 11px" }}>
             <div style={{ fontSize: 9, color: MUTED2, marginBottom: 1 }}>{k}</div>
             <div style={{ fontSize: 12, color: MUTED, fontFamily: MONO }}>{v}</div>
@@ -1120,7 +1339,20 @@ function PortfolioTab({ address, livePrice }: { address: string; livePrice: numb
   const winRate = total > 0n ? Math.round(Number(wins) / Number(total) * 100) : 0;
   const isStaked = !!stakedFlag;
   const entryPrice = positionData ? Number(positionData[1]) / 1e6 : 0;
-  const unrealizedPct = isOpen && entryPrice > 0 ? ((livePrice - entryPrice) / entryPrice * 100) : 0;
+  // The trader's own view of their (encrypted) position, from localStorage — kept
+  // consistent with the Chart tab. A copied/mirrored position is sealed even to its
+  // owner, so we must not show a long-assumed P&L for it.
+  const posMeta = (() => {
+    if (typeof window === "undefined") return null;
+    try { return JSON.parse(localStorage.getItem(`ct_posparams_${address}`) || "null") as { dir?: Dir; size?: number; lev?: number; copied?: boolean; leader?: string } | null; } catch { return null; }
+  })();
+  const openParams = posMeta && posMeta.dir ? (posMeta as { dir: Dir; size: number; lev: number }) : null;
+  const copiedFrom = posMeta && posMeta.copied ? posMeta.leader ?? null : null;
+  const canSeeOwn = !!openParams;
+  const posIsLong = openParams ? openParams.dir === "LONG" : true;
+  const posLev = openParams?.lev ?? 1;
+  const rawMovePct = isOpen && entryPrice > 0 ? ((livePrice - entryPrice) / entryPrice * 100) : 0;
+  const unrealizedPct = (posIsLong ? rawMovePct : -rawMovePct) * posLev;
   const pnlPos = unrealizedPct >= 0;
   const fCount = Number(followerCount ?? 0n);
 
@@ -1215,7 +1447,7 @@ function PortfolioTab({ address, livePrice }: { address: string; livePrice: numb
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 10, marginBottom: 20 }}>
         {[
-          { label: "Total copied", value: "$" + (fCount * 500).toLocaleString(), color: "#eef2f6" },
+          { label: "Copiers", value: fCount.toString(), color: "#eef2f6" },
           { label: "Win rate", value: total > 0n ? winRate + "%" : "—", color: GREEN },
           { label: "Followers", value: fCount + "/20", color: AMBER },
           { label: "Net P&L", value: (Number(pnlBps) >= 0 ? "+" : "") + (Number(pnlBps) / 100).toFixed(1) + "%", color: Number(pnlBps) >= 0 ? GREEN : RED_SOFT },
@@ -1263,26 +1495,39 @@ function PortfolioTab({ address, livePrice }: { address: string; livePrice: numb
           <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 15 }}>Your active position</div>
           {isOpen ? (
             <>
+              {copiedFrom && (
+                <div style={{ fontSize: 11, color: "#fbbf24", background: "#241b0c", border: "1px solid #5e4a24", borderRadius: 8, padding: "8px 11px", marginBottom: 12, fontFamily: MONO, lineHeight: 1.4 }}>
+                  🔒 Mirrored from {fmt(copiedFrom)} — direction, size &amp; P&L are encrypted even to you, revealed only at settlement.
+                </div>
+              )}
               <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 10, marginBottom: 14 }}>
                 <div style={{ background: INNER, borderRadius: 9, padding: 12 }}>
                   <div style={{ fontSize: 9, color: MUTED2, marginBottom: 3 }}>Direction</div>
-                  <div style={{ fontSize: 16, fontWeight: 700, color: GREEN }}>▲ Long</div>
-                  <div style={{ fontSize: 9, color: MUTED2, marginTop: 2, fontFamily: MONO }}>🔒 sealed</div>
+                  <div style={{ fontSize: 16, fontWeight: 700, color: canSeeOwn ? (posIsLong ? GREEN : RED_SOFT) : MUTED }}>{canSeeOwn ? (posIsLong ? "▲ Long" : "▼ Short") : "🔒 Sealed"}</div>
+                  <div style={{ fontSize: 9, color: MUTED2, marginTop: 2, fontFamily: MONO }}>{canSeeOwn ? "🔒 sealed to others" : "encrypted"}</div>
                 </div>
                 <div style={{ background: INNER, borderRadius: 9, padding: 12 }}>
-                  <div style={{ fontSize: 9, color: MUTED2, marginBottom: 3 }}>Size</div>
-                  <div style={{ fontSize: 16, fontWeight: 700, fontFamily: MONO }}>—</div>
-                  <div style={{ fontSize: 9, color: MUTED2, marginTop: 2, fontFamily: MONO }}>🔒 sealed</div>
+                  <div style={{ fontSize: 9, color: MUTED2, marginBottom: 3 }}>Size {canSeeOwn && openParams ? `· ${openParams.lev}×` : ""}</div>
+                  <div style={{ fontSize: 16, fontWeight: 700, fontFamily: MONO }}>{canSeeOwn && openParams ? openParams.size.toLocaleString() : "🔒"}</div>
+                  <div style={{ fontSize: 9, color: MUTED2, marginTop: 2, fontFamily: MONO }}>{canSeeOwn ? "🔒 sealed to others" : "encrypted"}</div>
                 </div>
                 <div style={{ background: INNER, borderRadius: 9, padding: 12 }}>
                   <div style={{ fontSize: 9, color: MUTED2, marginBottom: 3 }}>Entry</div>
                   <div style={{ fontSize: 16, fontWeight: 600, fontFamily: MONO }}>${entryPrice.toFixed(2)}</div>
                 </div>
-                <div style={{ background: pnlPos ? "rgba(34,197,94,.07)" : "rgba(239,68,68,.07)", borderRadius: 9, padding: 12 }}>
-                  <div style={{ fontSize: 9, color: pnlPos ? "rgba(74,222,128,.7)" : "rgba(252,165,165,.7)", marginBottom: 3 }}>Unr. P&L</div>
-                  <div style={{ fontSize: 20, fontWeight: 700, color: pnlPos ? GREEN : RED_SOFT, fontFamily: MONO }}>{pnlPos ? "+" : ""}{unrealizedPct.toFixed(2)}%</div>
-                  <div style={{ fontSize: 9, color: pnlPos ? "rgba(74,222,128,.7)" : "rgba(252,165,165,.7)", fontFamily: MONO }}>{pnlPos ? "+" : ""}{Math.round(unrealizedPct * 100)} bps</div>
-                </div>
+                {canSeeOwn ? (
+                  <div style={{ background: pnlPos ? "rgba(34,197,94,.07)" : "rgba(239,68,68,.07)", borderRadius: 9, padding: 12 }}>
+                    <div style={{ fontSize: 9, color: pnlPos ? "rgba(74,222,128,.7)" : "rgba(252,165,165,.7)", marginBottom: 3 }}>Unr. P&L</div>
+                    <div style={{ fontSize: 20, fontWeight: 700, color: pnlPos ? GREEN : RED_SOFT, fontFamily: MONO }}>{pnlPos ? "+" : ""}{unrealizedPct.toFixed(2)}%</div>
+                    <div style={{ fontSize: 9, color: pnlPos ? "rgba(74,222,128,.7)" : "rgba(252,165,165,.7)", fontFamily: MONO }}>{pnlPos ? "+" : ""}{Math.round(unrealizedPct * 100)} bps</div>
+                  </div>
+                ) : (
+                  <div style={{ background: "rgba(245,158,11,.06)", border: "1px solid #5e4a24", borderRadius: 9, padding: 12 }}>
+                    <div style={{ fontSize: 9, color: "rgba(251,191,36,.7)", marginBottom: 3 }}>Unr. P&L</div>
+                    <div style={{ fontSize: 16, fontWeight: 700, color: "#fbbf24", fontFamily: MONO }}>🔒 Sealed</div>
+                    <div style={{ fontSize: 9, color: MUTED2, fontFamily: MONO }}>on close</div>
+                  </div>
+                )}
               </div>
               <button onClick={handleClose} disabled={loading} style={{ padding: "11px 24px", border: "1px solid rgba(252,165,165,.2)", background: "rgba(252,165,165,.06)", color: RED_SOFT, fontSize: 13, fontWeight: 600, borderRadius: 9, cursor: "pointer", fontFamily: SANS }}>
                 {loading ? "Closing…" : "Close & settle"}

@@ -22,6 +22,147 @@ html{scroll-behavior:smooth;}
 ::selection{background:#f59e0b;color:#fff;}
 `;
 
+function GravityGrid() {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const container = containerRef.current;
+    if (!canvas || !container) return;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    let W = 0, H = 0;
+
+    const COLS = 36, ROWS = 18;
+    type Dot = {
+      ox: number; oy: number;   // origin in canvas px
+      x: number; y: number;     // current position
+      vx: number; vy: number;   // velocity
+      hue: number;
+    };
+    let dots: Dot[] = [];
+
+    const build = () => {
+      const rect = container.getBoundingClientRect();
+      W = rect.width; H = rect.height;
+      canvas.width = W * dpr; canvas.height = H * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      dots = [];
+      for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+          const ox = (c + 0.5) / COLS * W;
+          const oy = (r + 0.5) / ROWS * H;
+          const hue = (c / COLS * 200 + r / ROWS * 80) % 360;
+          dots.push({ ox, oy, x: ox, y: oy, vx: 0, vy: 0, hue });
+        }
+      }
+    };
+
+    build();
+    const ro = new ResizeObserver(build);
+    ro.observe(container);
+
+    let mouseX = -9999, mouseY = -9999;
+    let burst: { x: number; y: number; t: number } | null = null;
+
+    const onMove = (e: MouseEvent) => {
+      const rect = canvas.getBoundingClientRect();
+      mouseX = e.clientX - rect.left;
+      mouseY = e.clientY - rect.top;
+    };
+    const onLeave = () => { mouseX = -9999; mouseY = -9999; };
+    const onClick = (e: MouseEvent) => {
+      const rect = canvas.getBoundingClientRect();
+      burst = { x: e.clientX - rect.left, y: e.clientY - rect.top, t: 0 };
+    };
+
+    canvas.addEventListener("mousemove", onMove);
+    canvas.addEventListener("mouseleave", onLeave);
+    canvas.addEventListener("click", onClick);
+
+    let rafId = 0;
+    const ATTRACT_R = 140, ATTRACT_STRENGTH = 0.09;
+    const SPRING = 0.045, DAMPING = 0.82;
+    const BURST_R = 120, BURST_STRENGTH = 14;
+    const DOT_R = 2.2;
+
+    const loop = () => {
+      rafId = requestAnimationFrame(loop);
+      ctx.clearRect(0, 0, W, H);
+
+      for (const d of dots) {
+        // spring back to origin
+        let fx = (d.ox - d.x) * SPRING;
+        let fy = (d.oy - d.y) * SPRING;
+
+        // mouse attraction
+        const dx = mouseX - d.x, dy = mouseY - d.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < ATTRACT_R && dist > 0.1) {
+          const f = ATTRACT_STRENGTH * (1 - dist / ATTRACT_R);
+          fx += dx / dist * f * W * 0.012;
+          fy += dy / dist * f * H * 0.012;
+        }
+
+        // burst repulsion
+        if (burst) {
+          const bx = burst.x - d.x, by = burst.y - d.y;
+          const bd = Math.sqrt(bx * bx + by * by);
+          if (bd < BURST_R && bd > 0.1) {
+            const f = BURST_STRENGTH * (1 - bd / BURST_R) * Math.max(0, 1 - burst.t / 12);
+            fx -= bx / bd * f;
+            fy -= by / bd * f;
+          }
+        }
+
+        d.vx = (d.vx + fx) * DAMPING;
+        d.vy = (d.vy + fy) * DAMPING;
+        d.x += d.vx;
+        d.y += d.vy;
+
+        // color: base is hue, brightness increases near mouse
+        const proximity = dist < ATTRACT_R ? (1 - dist / ATTRACT_R) : 0;
+        const lightness = 25 + proximity * 45;
+        const alpha = 0.35 + proximity * 0.55;
+        ctx.beginPath();
+        ctx.arc(d.x, d.y, DOT_R + proximity * 1.8, 0, Math.PI * 2);
+        ctx.fillStyle = `hsla(${d.hue},80%,${lightness}%,${alpha})`;
+        ctx.fill();
+      }
+
+      if (burst) {
+        burst.t++;
+        if (burst.t > 20) burst = null;
+      }
+    };
+    rafId = requestAnimationFrame(loop);
+
+    return () => {
+      cancelAnimationFrame(rafId);
+      ro.disconnect();
+      canvas.removeEventListener("mousemove", onMove);
+      canvas.removeEventListener("mouseleave", onLeave);
+      canvas.removeEventListener("click", onClick);
+    };
+  }, []);
+
+  return (
+    <div ref={containerRef} style={{ position: "relative", width: "100%", height: 360, cursor: "crosshair" }}>
+      <canvas ref={canvasRef} style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }} />
+      <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
+        <div style={{ fontFamily: "var(--font-jetbrains-mono), monospace", fontSize: 12, letterSpacing: 2, color: "#f59e0b", textTransform: "uppercase", marginBottom: 14, opacity: 0.7 }}>Every dot knows where it belongs</div>
+        <div style={{ fontSize: 34, fontWeight: 700, letterSpacing: -1, color: "#eef2f6", textAlign: "center", lineHeight: 1.2 }}>Data is always pulled<br />toward the truth.</div>
+        <div style={{ marginTop: 16, fontSize: 14, color: "#7d8896", maxWidth: 420, textAlign: "center", lineHeight: 1.6 }}>FHE computes on encrypted values the same way — the math runs, but the plaintext never leaves your browser.</div>
+      </div>
+    </div>
+  );
+}
+
 export default function Landing() {
   const [price, setPrice] = useState(1043.5);
   const [heroPhase, setHeroPhase] = useState(0);
@@ -618,6 +759,11 @@ export default function Landing() {
             </div>
           ))}
         </div>
+      </div>
+
+      {/* GRAVITY GRID */}
+      <div style={{ marginTop: 80, borderTop: "1px solid #14181f", borderBottom: "1px solid #14181f", background: "#0a0c10", overflow: "hidden" }}>
+        <GravityGrid />
       </div>
 
       {/* STAKING / FEES */}

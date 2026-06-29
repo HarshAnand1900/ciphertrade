@@ -22,6 +22,7 @@ const toc = [
   { label: "What FHE does", href: "#fhe" },
   { label: "Settlement", href: "#settlement" },
   { label: "Fees & staking", href: "#economics" },
+  { label: "Known limitations", href: "#limitations" },
   { label: "FAQ", href: "#faq" },
 ];
 
@@ -29,7 +30,7 @@ const tldr = [
   "A trader's direction and size are encrypted in the browser before anything is broadcast.",
   "The contract copies, sizes and tracks positions while every value stays ciphertext.",
   "Front-runners and validators only ever see encrypted blobs — no mempool leak.",
-  "On close, a KMS decrypts the result and pays followers pro-rata, minus the performance fee.",
+  "On close, a KMS decrypts the real sealed values and writes the verified result to on-chain history.",
 ];
 
 const lifeData = [
@@ -52,12 +53,12 @@ const lifeData = [
     ],
   },
   {
-    label: "3 · Copy", icon: "👥", tag: "FHE COMPUTE", title: "Followers copy under FHE",
-    body: "Each follower's allocation is scaled against the encrypted size homomorphically. Nobody learns the lead's size — the math runs on ciphertext.",
+    label: "3 · Copy", icon: "👥", tag: "FHE COMPUTE", title: "Followers mirror under FHE",
+    body: "Copying opens a 1:1 sealed mirror: the lead's encrypted direction, size and leverage are copied straight into the follower's own position — as independent ciphertexts, so neither side is ever decrypted. The follower closes and settles it on their own entry/exit.",
     code: [
-      { prefix: "", text: "alloc = FHE.mul(size, ratio)" },
-      { prefix: "// still ", text: "encrypted euint64" },
-      { prefix: "→ ", text: "copies[follower] = alloc 🔒" },
+      { prefix: "", text: "copyTrade(leader, price)" },
+      { prefix: "// copy ", text: "dir = FHE.and(lead.dir, true)" },
+      { prefix: "→ ", text: "positions[follower] = sealed 🔒" },
     ],
   },
   {
@@ -99,9 +100,16 @@ const econRows = [
   { param: "Follower slots", unstaked: "20", staked: "20" },
 ];
 
+const limitations = [
+  { tag: "PROTOTYPE", title: "Positions are uncollateralized", body: "This testnet build does not lock margin equal to a position's size, so settled P&L is not backed by collateral. Margin-locking against the confidential cUSDT balance is the natural next step for a mainnet version." },
+  { tag: "TRUST", title: "Settlement runs through an admin key", body: "Closing marks the ciphertext publicly decryptable; an off-chain settler then decrypts the real values and submits them. It never trusts the browser, but it is a liveness dependency — if the settler is offline, history populates once it runs. A fully on-chain decryption-oracle callback removes this." },
+  { tag: "SCOPE", title: "TP/SL is sealed, not auto-executed", body: "Encrypted take-profit / stop-loss targets are stored on-chain and hidden from copiers, but the contract does not yet auto-close when price crosses them. They are confidential markers, not automated triggers." },
+  { tag: "PRIVACY", title: "The copy link is public", body: "Direction, size, leverage and P&L stay encrypted, but the fact that you copied a given trader (and the entry price) is visible on-chain — the contract must read the lead's position by address to mirror it. CipherTrade hides the trade, not the relationship." },
+];
+
 const faqData = [
   { q: "Can I see the trader I'm copying?", a: "No — and that's the point. You see their verified track record (settled count, 30-day return, win rate) but never their live direction or size. You're betting on the record, not reverse-engineering the trade." },
-  { q: "How do followers get paid if the trade is hidden?", a: "Your allocation is scaled against the encrypted size homomorphically. At settlement the KMS decrypts the outcome and the contract pays each follower pro-rata to their allocation in a single transaction." },
+  { q: "How does copying work if the trade is hidden?", a: "Copying opens a 1:1 sealed mirror of the lead's position — their encrypted direction, size and leverage are copied straight into your own position as independent ciphertexts, without anyone decrypting them. You then close and settle that mirror on your own entry and exit, exactly like a normal position. You copy the sealed trade, not a number you can read." },
   { q: "What is cUSDT?", a: "A confidential USDT balance — your stake and allocations are held as encrypted token amounts, so even your position sizing stays private on-chain." },
   { q: "Is my own position visible to me?", a: "Yes. You can always decrypt your own position locally with your key. What stays hidden is the lead trader's position from followers, and everyone's positions from the public." },
 ];
@@ -269,7 +277,7 @@ export default function DocsPage() {
               <span style={{ fontFamily: MONO, fontSize: 14, color: AMBER }}>04</span>Settlement &amp; decryption
             </h2>
             <p style={{ fontSize: 16, lineHeight: 1.7, color: "#aeb8c4", margin: "0 0 22px" }}>
-              When a position closes, its encrypted values are marked publicly decryptable. A Key Management Service (KMS) decrypts them off-chain and posts the cleartext result back. Profit is split pro-rata across followers, the performance fee is deducted, and everyone is paid in the same transaction.
+              When a position closes, its encrypted values are marked publicly decryptable. A Key Management Service (KMS) decrypts the <span style={{ color: "#eef2f6", fontWeight: 600 }}>real on-chain ciphertext</span> — not anything the browser claims — and the contract records the verified direction, size, leverage and P&amp;L to the trader&apos;s history, crediting their confidential balance. A copied position is its own sealed mirror, so each follower settles independently the exact same way.
             </p>
             <div style={{ background: "#0c1118", border: "1px solid #1b222b", borderRadius: 18, padding: 24 }}>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18 }}>
@@ -293,7 +301,7 @@ export default function DocsPage() {
               </div>
               <div style={{ marginTop: 14, fontFamily: MONO, fontSize: 11.5, color: AMBER, display: "flex", alignItems: "center", gap: 8 }}>
                 <span style={{ width: 6, height: 6, borderRadius: "50%", background: settleDone ? GREEN : "#fbbf24", animation: "ctPulse 1.5s infinite", display: "inline-block" }} />
-                {settleDone ? "decrypted — payouts settled to 5 followers" : settleRunning ? "KMS decrypting encrypted values…" : "position sealed · click settle to decrypt"}
+                {settleDone ? "decrypted — verified P&L written to on-chain history" : settleRunning ? "KMS decrypting the real on-chain ciphertext…" : "position sealed · click settle to decrypt"}
               </div>
             </div>
           </div>
@@ -322,10 +330,31 @@ export default function DocsPage() {
             </div>
           </div>
 
-          {/* §6 FAQ */}
+          {/* §6 KNOWN LIMITATIONS */}
+          <div id="limitations" style={{ scrollMarginTop: 90, marginBottom: 64 }}>
+            <h2 style={{ fontSize: 28, fontWeight: 700, letterSpacing: -0.5, margin: "0 0 16px", display: "flex", alignItems: "center", gap: 12 }}>
+              <span style={{ fontFamily: MONO, fontSize: 14, color: AMBER }}>06</span>Known limitations
+            </h2>
+            <p style={{ fontSize: 16, lineHeight: 1.7, color: "#aeb8c4", margin: "0 0 22px" }}>
+              CipherTrade is a working prototype on Sepolia, built to demonstrate confidential copy-trading under FHE. In the interest of being straight about scope, here is what it deliberately does <span style={{ color: "#eef2f6", fontWeight: 600 }}>not</span> do yet — none of these affect the confidentiality guarantees, only the production-economics around them.
+            </p>
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              {limitations.map((l) => (
+                <div key={l.title} style={{ background: "#0f141a", border: "1px solid #1b222b", borderRadius: 13, padding: "18px 20px" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 7 }}>
+                    <span style={{ fontFamily: MONO, fontSize: 10, letterSpacing: 1, color: "#fbbf24", background: "#241b0c", border: "1px solid #5e4a24", padding: "3px 8px", borderRadius: 6 }}>{l.tag}</span>
+                    <span style={{ fontSize: 15, fontWeight: 600 }}>{l.title}</span>
+                  </div>
+                  <div style={{ fontSize: 14, lineHeight: 1.6, color: "#8b95a3" }}>{l.body}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* §7 FAQ */}
           <div id="faq" style={{ scrollMarginTop: 90, marginBottom: 56 }}>
             <h2 style={{ fontSize: 28, fontWeight: 700, letterSpacing: -0.5, margin: "0 0 22px", display: "flex", alignItems: "center", gap: 12 }}>
-              <span style={{ fontFamily: MONO, fontSize: 14, color: AMBER }}>06</span>FAQ
+              <span style={{ fontFamily: MONO, fontSize: 14, color: AMBER }}>07</span>FAQ
             </h2>
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
               {faqData.map((f, i) => (
