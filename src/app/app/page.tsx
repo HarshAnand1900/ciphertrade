@@ -606,6 +606,9 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
     setLoading(true); setStatusMsg(""); setEncrypting(true);
     try {
       setStatusMsg("Encrypting TP/SL…");
+      // Let the browser paint the loading state BEFORE the synchronous FHE WASM
+      // work blocks the main thread — otherwise the tab feels unresponsive.
+      await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
       const fhevm = await getFhevm();
       const input = fhevm.createEncryptedInput(CIPHER_TRADE_ADDRESS, address);
       input.add64(BigInt(Math.round(Number(tp) * 1e6)));
