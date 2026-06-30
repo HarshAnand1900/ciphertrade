@@ -1,36 +1,60 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# CipherTrade
 
-## Getting Started
+Confidential copy-trading on Ethereum, powered by Fully Homomorphic Encryption (FHE).
 
-First, run the development server:
+**Live app:** https://ciphertrade-app.vercel.app
+**Contract (Sepolia, verified):** [`0x1762457f9a8c4b7996018b0555586d22db34102E`](https://sepolia.etherscan.io/address/0x1762457f9a8c4b7996018b0555586d22db34102E#code)
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+## What it does
+
+Public copy-trading platforms broadcast a trader's position the instant it opens — front-runners pile in and the edge is gone before followers profit. CipherTrade closes that gap with Zama's FHEVM: direction, size, and leverage are encrypted in the browser before anything is broadcast. The contract still matches positions, mirrors trades for followers, and computes P&L — all on ciphertext. Nobody, including validators, sees the trade until the trader settles.
+
+- **Open a position** — direction, size, and leverage encrypted client-side (`ebool`, `euint64`) before being submitted on-chain
+- **Copy a trader** — `copyTrade()` opens a 1:1 sealed mirror of a leader's encrypted position using independent ciphertext copies, never decrypting either side
+- **Settle trustlessly** — on close, an off-chain settler decrypts the real on-chain ciphertext via Zama's relayer and posts the verified result; the browser is never trusted
+- **Confidential balance** — stake and trade with `cUSDT`, an encrypted ERC-7984-style token; only you can decrypt your own balance
+- **Leaderboard & track record** — settled trades become public so reputation is verifiable, while live positions stay sealed
+
+## Stack
+
+- **Contracts:** Solidity + Zama FHEVM (`@fhevm/hardhat-plugin`), Hardhat, deployed to Sepolia
+- **Frontend:** Next.js 15, wagmi v2, viem, RainbowKit
+- **FHE:** `@zama-fhe/relayer-sdk` for client-side encryption and `userDecrypt`
+- **Settlement:** Next.js API route + `@zama-fhe/relayer-sdk/node` for `publicDecrypt`
+
+## Project structure
+
+```
+src/
+  app/
+    page.tsx            # Landing page
+    app/page.tsx         # Trading app (Chart, Discover, Following, Portfolio, Leaderboard)
+    docs/page.tsx         # Documentation
+    api/settle/route.ts  # Trustless settlement endpoint
+  lib/
+    contract.ts          # Contract address + ABI
+    fhe.ts                # FHEVM instance singleton, encrypt/decrypt helpers
+    wagmi.ts              # wagmi/RainbowKit config
+contracts/
+  CipherTrade.sol         # Main contract (Hardhat project: fhevm-hardhat-template)
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Known limitations
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+This is a working prototype on Sepolia testnet, built to demonstrate confidential copy-trading under FHE:
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+- Positions are uncollateralized — margin isn't locked against the confidential balance
+- Settlement relies on an off-chain settler with an admin key (never trusts the browser, but is a liveness dependency)
+- Take-profit / stop-loss are sealed on-chain but not yet auto-executed
+- The fact that you copied a trader (and at what price) is visible on-chain — direction, size, leverage, and P&L stay encrypted
 
-## Learn More
+See `/docs` in the app for the full writeup.
 
-To learn more about Next.js, take a look at the following resources:
+## Local development
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```bash
+npm install
+npm run dev
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Requires `NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID`, `ADMIN_PRIVATE_KEY`, and `SEPOLIA_RPC_URL` in `.env.local`.
