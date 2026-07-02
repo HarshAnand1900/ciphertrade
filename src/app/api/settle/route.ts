@@ -19,6 +19,14 @@ const ABI = parseAbi([
 
 export async function POST(req: NextRequest) {
   try {
+    // Cheap anti-griefing check: require a shared secret so randoms can't spam
+    // this endpoint and burn the admin wallet's gas. Not a security boundary —
+    // settlement always decrypts real on-chain ciphertext regardless of caller.
+    const settleSecret = process.env.SETTLE_SHARED_SECRET;
+    if (settleSecret && req.headers.get("x-settle-secret") !== settleSecret) {
+      return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+    }
+
     const { trader: rawTrader } = (await req.json()) as { trader: string };
     if (!rawTrader) return NextResponse.json({ error: "trader required" }, { status: 400 });
     const trader = getAddress(rawTrader);

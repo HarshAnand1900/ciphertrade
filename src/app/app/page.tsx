@@ -232,6 +232,7 @@ function EncryptionProof({ address, onClose }: { address: string; onClose: () =>
   const [txHash, setTxHash] = useState<string>("");
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [txArgs, setTxArgs] = useState<any[]>([]);
+  const [entryPrice, setEntryPrice] = useState<bigint>(0n);
 
   useEffect(() => {
     if (!publicClient) { setState("none"); return; }
@@ -242,7 +243,7 @@ function EncryptionProof({ address, onClose }: { address: string; onClose: () =>
         // Don't use args filter — many Sepolia RPCs ignore topic filters silently.
         // Instead fetch all PositionOpened events for the contract and filter client-side.
         const spans = [1000n, 3000n, 8000n, 20000n];
-        let found: { hash: `0x${string}`; } | null = null;
+        let found: { hash: `0x${string}`; entryPrice: bigint } | null = null;
         for (const span of spans) {
           if (cancelled) return;
           const from = latest > span ? latest - span : 0n;
@@ -254,7 +255,11 @@ function EncryptionProof({ address, onClose }: { address: string; onClose: () =>
               toBlock: latest,
             });
             const mine = allLogs.filter(l => (l.args as { trader?: string }).trader?.toLowerCase() === address.toLowerCase());
-            if (mine.length) { found = { hash: mine[mine.length - 1].transactionHash! }; break; }
+            if (mine.length) {
+              const last = mine[mine.length - 1];
+              found = { hash: last.transactionHash!, entryPrice: (last.args as { entryPrice?: bigint }).entryPrice ?? 0n };
+              break;
+            }
           } catch { /* RPC rejected range, widen */ }
         }
         if (cancelled) return;
@@ -264,6 +269,7 @@ function EncryptionProof({ address, onClose }: { address: string; onClose: () =>
         if (cancelled) return;
         setTxHash(found.hash);
         setTxArgs(decoded.args as unknown as unknown[]);
+        setEntryPrice(found.entryPrice);
         setState("ready");
       } catch { if (!cancelled) setState("none"); }
     })();
@@ -301,7 +307,7 @@ function EncryptionProof({ address, onClose }: { address: string; onClose: () =>
               { label: "Direction (long/short)", val: txArgs[0] as string, enc: true },
               { label: "Size (units)", val: txArgs[1] as string, enc: true },
               { label: "Leverage (1×–20×)", val: txArgs[2] as string, enc: true },
-              { label: "Entry price (public by design)", val: "$" + (Number(txArgs[4]) / 1e6).toFixed(2), enc: false },
+              { label: "Entry price (from Chainlink oracle)", val: "$" + (Number(entryPrice) / 1e6).toFixed(2), enc: false },
             ].map(r => (
               <div key={r.label} style={{ display: "flex", alignItems: "center", gap: 12, background: INNER, borderRadius: 9, padding: "11px 14px", marginBottom: 8 }}>
                 <div style={{ minWidth: 190 }}>
@@ -549,9 +555,9 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
       input.addBool(dir === "LONG"); input.add64(BigInt(Math.floor(Number(size)))); input.add64(BigInt(lev));
       const encrypted = await input.encrypt();
       setStatusMsg("Broadcasting…");
-      // snapshot the live ETH price (6 decimals) as the on-chain entry price
-      const price6 = BigInt(Math.round(livePrice * 1e6));
-      const hash = await writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "openPosition", args: [toHex(encrypted.handles[0]), toHex(encrypted.handles[1]), toHex(encrypted.handles[2]), toHex(encrypted.inputProof), price6] });
+      // Entry price is snapshotted on-chain from the Chainlink oracle — never
+      // sent from the browser, so it can't be self-reported.
+      const hash = await writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "openPosition", args: [toHex(encrypted.handles[0]), toHex(encrypted.handles[1]), toHex(encrypted.handles[2]), toHex(encrypted.inputProof)] });
       setStatusMsg("Confirming…");
       await publicClient?.waitForTransactionReceipt({ hash });
       // Store the trader's own view of their params (display only; settlement
@@ -567,8 +573,8 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
   async function handleClose() {
     setLoading(true); setStatusMsg("Closing…");
     try {
-      const price6 = BigInt(Math.round(livePrice * 1e6));
-      const hash = await writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "closePosition", args: [price6] });
+      // Exit price comes from the on-chain Chainlink oracle, not the browser.
+      const hash = await writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "closePosition", args: [] });
       setStatusMsg("Confirming…");
       await publicClient?.waitForTransactionReceipt({ hash });
       localStorage.removeItem(tpslKey);
@@ -580,7 +586,10 @@ function ChartTab({ address, livePrice }: { address: string; livePrice: number }
       try {
         await fetch("/api/settle", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            ...(process.env.NEXT_PUBLIC_SETTLE_SECRET ? { "x-settle-secret": process.env.NEXT_PUBLIC_SETTLE_SECRET } : {}),
+          },
           body: JSON.stringify({ trader: address }),
         });
       } catch { /* settle errors are non-fatal; KMS can settle later */ }
@@ -985,9 +994,8 @@ function DiscoverTab({ address, livePrice }: { address: string; livePrice: numbe
     setLoading(true); setFollowErr("");
     try {
       // Homomorphic copy: opens a sealed mirror of the leader's encrypted position
-      // for the follower at the current entry price. No value is ever decrypted.
-      const price6 = BigInt(Math.round(livePrice * 1e6));
-      const hash = await writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "copyTrade", args: [followModal as `0x${string}`, 1n, price6] });
+      // for the follower. Entry price comes from the on-chain oracle, not the browser.
+      const hash = await writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "copyTrade", args: [followModal as `0x${string}`, 1n] });
       await publicClient?.waitForTransactionReceipt({ hash });
       // Mark this as a mirrored position the follower CANNOT introspect — its
       // direction/size are encrypted even to them. The Chart/Portfolio tabs read
@@ -1335,7 +1343,7 @@ function PortfolioTab({ address, livePrice }: { address: string; livePrice: numb
   const { data: balHandle, refetch: refetchBal } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "confidentialBalanceOf", args: [address as `0x${string}`], query: { enabled: !!address } }) as { data: `0x${string}` | undefined; refetch: () => void };
   const { data: traderStats } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "traderStats", args: [address as `0x${string}`], query: { enabled: !!address } }) as { data: [bigint, bigint, bigint] | undefined };
   const { data: followerCount } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getFollowerCount", args: [address as `0x${string}`], query: { enabled: !!address } }) as { data: bigint | undefined };
-  const { data: history } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getTradeHistory", args: [address as `0x${string}`], query: { enabled: !!address } }) as { data: readonly { entryPrice: bigint; exitPrice: bigint; direction: boolean; size: bigint; leverage: bigint; pnlBps: bigint; timestamp: bigint }[] | undefined };
+  const { data: history } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "getTradeHistory", args: [address as `0x${string}`], query: { enabled: !!address } }) as { data: readonly { entryPrice: bigint; exitPrice: bigint; direction: boolean; size: bigint; leverage: bigint; pnlBps: bigint; feeBps: bigint; timestamp: bigint }[] | undefined };
   const { data: myUsername, refetch: refetchUsername } = useReadContract({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "usernames", args: [address as `0x${string}`], query: { enabled: !!address } }) as { data: string | undefined; refetch: () => void };
 
   const [total, wins, pnlBps] = traderStats ?? [0n, 0n, 0n];
@@ -1380,7 +1388,7 @@ function PortfolioTab({ address, livePrice }: { address: string; livePrice: numb
   }
 
   const handleClose = () => tx(
-    () => writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "closePosition", args: [BigInt(Math.round(livePrice * 1e6))] }),
+    () => writeContractAsync({ address: CIPHER_TRADE_ADDRESS, abi: CIPHER_TRADE_ABI, functionName: "closePosition", args: [] }),
     () => { refetchOpen(); refetchBal(); setCBalance(null); }
   );
   const handleFaucet = () => tx(
@@ -1481,7 +1489,7 @@ function PortfolioTab({ address, livePrice }: { address: string; livePrice: numb
             </button>
           ) : (
             <div>
-              <div style={{ fontSize: 11, color: MUTED2, marginBottom: 6 }}>Convert Sepolia USDT → cUSDT</div>
+              <div style={{ fontSize: 11, color: MUTED2, marginBottom: 6 }}>Mint test cUSDT (testnet only, no real token backing)</div>
               <div style={{ display: "flex", gap: 8 }}>
                 <input value={wrapAmt} onChange={e => setWrapAmt(e.target.value.replace(/[^0-9.]/g, ""))} style={{ flex: 1, padding: "9px 12px", background: INNER, border: `1px solid ${BORDER}`, borderRadius: 9, color: "#eef2f6", fontSize: 14, fontFamily: MONO }} />
                 <button onClick={handleWrap} disabled={loading} style={{ padding: "9px 18px", border: "1px solid #6b5320", background: "transparent", color: "#fbbf24", fontSize: 13, fontWeight: 600, borderRadius: 9, cursor: loading ? "not-allowed" : "pointer", fontFamily: SANS, whiteSpace: "nowrap" }}>
@@ -1571,7 +1579,8 @@ function PortfolioTab({ address, livePrice }: { address: string; livePrice: numb
           [...history].reverse().map((tr, i) => {
             const pnl = Number(tr.pnlBps) / 100;
             const isWin = pnl > 0;
-            const fee = Math.abs(pnl * (isStaked ? 0.18 : 0.08)).toFixed(2);
+            // Real fee skimmed on-chain by settlePosition (0 on losing trades).
+            const fee = (Number(tr.feeBps ?? 0n) / 100).toFixed(2);
             return (
               <div key={i} style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr 1fr 1fr 1fr", padding: "12px 16px", borderTop: `1px solid ${BORDER2}`, alignItems: "center" }}>
                 <div style={{ fontSize: 11, color: MUTED2, fontFamily: MONO }}>{new Date(Number(tr.timestamp) * 1000).toLocaleDateString()}</div>

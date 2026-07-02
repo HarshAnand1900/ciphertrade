@@ -101,10 +101,11 @@ const econRows = [
 ];
 
 const limitations = [
-  { tag: "PROTOTYPE", title: "Positions are uncollateralized", body: "This testnet build does not lock margin equal to a position's size, so settled P&L is not backed by collateral. Margin-locking against the confidential cUSDT balance is the natural next step for a mainnet version." },
+  { tag: "PROTOTYPE", title: "Positions are uncollateralized", body: "This testnet build does not lock margin equal to a position's size, so settled P&L is not backed by collateral. A losing trade that exceeds the trader's cUSDT balance is capped at their balance rather than reverting. Margin-locking against the confidential cUSDT balance is the natural next step for a mainnet version." },
   { tag: "TRUST", title: "Settlement runs through an admin key", body: "Closing marks the ciphertext publicly decryptable; an off-chain settler then decrypts the real values and submits them. It never trusts the browser, but it is a liveness dependency — if the settler is offline, history populates once it runs. A fully on-chain decryption-oracle callback removes this." },
   { tag: "SCOPE", title: "TP/SL is sealed, not auto-executed", body: "Encrypted take-profit / stop-loss targets are stored on-chain and hidden from copiers, but the contract does not yet auto-close when price crosses them. They are confidential markers, not automated triggers." },
-  { tag: "PRIVACY", title: "The copy link is public", body: "Direction, size, leverage and P&L stay encrypted, but the fact that you copied a given trader (and the entry price) is visible on-chain — the contract must read the lead's position by address to mirror it. CipherTrade hides the trade, not the relationship." },
+  { tag: "PRIVACY", title: "The copy link is public", body: "Direction, size, leverage and P&L stay encrypted, but the fact that you copied a given trader is visible on-chain — the contract must read the lead's position by address to mirror it. CipherTrade hides the trade, not the relationship." },
+  { tag: "TESTNET", title: "cUSDT is a mock token", body: "wrap()/faucet() mint confidential cUSDT out of thin air for testing — there's no real USDT backing it. A mainnet version would wrap a real ERC-20 with a locked deposit." },
 ];
 
 const faqData = [

@@ -1,13 +1,13 @@
 import { parseAbi } from "viem";
 
-export const CIPHER_TRADE_ADDRESS = "0x1762457f9a8c4b7996018b0555586d22db34102E";
+export const CIPHER_TRADE_ADDRESS = "0xa76FD6549554b2Df202Ba4E1E3db5605Ef92d2f6";
 
 export const CIPHER_TRADE_ABI = parseAbi([
   // ── Write ──
-  "function openPosition(bytes32 inputDirection, bytes32 inputSize, bytes32 inputLeverage, bytes calldata inputProof, uint256 price) external",
-  "function closePosition(uint256 price) external",
+  "function openPosition(bytes32 inputDirection, bytes32 inputSize, bytes32 inputLeverage, bytes calldata inputProof) external",
+  "function closePosition() external",
   "function followTrader(address trader, uint256 allocation) external",
-  "function copyTrade(address leader, uint256 allocation, uint256 price) external",
+  "function copyTrade(address leader, uint256 allocation) external",
   "function settlePosition(address trader, bool direction, uint64 size, uint64 leverage) external",
   "function stake() external",
   "function unstake() external",
@@ -35,7 +35,7 @@ export const CIPHER_TRADE_ABI = parseAbi([
   "function getTraders() external view returns (address[])",
   "function isRegistered(address) external view returns (bool)",
   "function getTradeCount(address trader) external view returns (uint256)",
-  "struct Trade { uint256 entryPrice; uint256 exitPrice; bool direction; uint64 size; uint64 leverage; int256 pnlBps; uint256 timestamp; }",
+  "struct Trade { uint256 entryPrice; uint256 exitPrice; bool direction; uint64 size; uint64 leverage; int256 pnlBps; int256 feeBps; uint256 timestamp; }",
   "function getTradeHistory(address trader) external view returns (Trade[])",
   "function traderStats(address) external view returns (uint256 totalTrades, uint256 wins, int256 netPnlBps)",
 
