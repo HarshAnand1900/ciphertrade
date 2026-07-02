@@ -2,8 +2,8 @@
 
 Confidential copy-trading on Ethereum, powered by Fully Homomorphic Encryption (FHE).
 
-**Live app:** https://ciphertrade-app.vercel.app
-**Contract (Sepolia, verified):** [`0x1762457f9a8c4b7996018b0555586d22db34102E`](https://sepolia.etherscan.io/address/0x1762457f9a8c4b7996018b0555586d22db34102E#code)
+**Live app:** https://ciphertrade-5k8o0ei14-harshanand1900s-projects.vercel.app
+**Contract (Sepolia, verified):** [`0xa76FD6549554b2Df202Ba4E1E3db5605Ef92d2f6`](https://sepolia.etherscan.io/address/0xa76FD6549554b2Df202Ba4E1E3db5605Ef92d2f6#code)
 
 ## What it does
 
@@ -43,10 +43,13 @@ contracts/
 
 This is a working prototype on Sepolia testnet, built to demonstrate confidential copy-trading under FHE:
 
-- Positions are uncollateralized — margin isn't locked against the confidential balance
+- Positions are uncollateralized — a losing trade beyond the trader's cUSDT balance is capped, not liquidated
 - Settlement relies on an off-chain settler with an admin key (never trusts the browser, but is a liveness dependency)
 - Take-profit / stop-loss are sealed on-chain but not yet auto-executed
-- The fact that you copied a trader (and at what price) is visible on-chain — direction, size, leverage, and P&L stay encrypted
+- The fact that you copied a trader is visible on-chain — direction, size, leverage, and P&L stay encrypted
+- `cUSDT` is a mock testnet token (`wrap()`/`faucet()` mint it directly; no real token backs it)
+
+Entry and exit prices are read on-chain from a Chainlink ETH/USD price feed — they cannot be self-reported by a caller.
 
 See `/docs` in the app for the full writeup.
 
